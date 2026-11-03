@@ -20,6 +20,9 @@ import importlib.util
 import json
 import math
 import os
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from statistics import NormalDist
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
@@ -447,6 +450,7 @@ class AscendConfig:
             "msmonitor_use_daemon": false,
             "enable_transpose_kv_cache_by_block": true,
             "weight_nz_mode": 1,
+            "enable_lm_head_quant": false,
             "enable_shared_expert_dp": false,
             "enable_sparse_sfa_c8": false,
             "enable_sparse_li_c8": false,
@@ -585,6 +589,7 @@ class AscendConfig:
     enable_force_eplb: bool = False
     enable_pcp_o_proj_weight_sharding: bool = True
     enable_pcp_embedding_lmhead_weight_sharding: bool = True
+    enable_lm_head_quant: bool = False
     draft_window_size: int | None = None
     mix_placement: bool = False
     # When non-zero, force the MC2 combine stage's comm quant_mode to this
@@ -686,6 +691,7 @@ class AscendConfig:
     # the max_num_batched_tokens that sequence-parallel writeback corrected).
     def derive_and_validate(self, vllm_config: VllmConfig) -> AscendConfig:
         vc = vllm_config
+        self._validate_lm_head_quant(vc)
         engram_config = getattr(vc, "engram_config", None)
         if (
             engram_config is not None
@@ -936,6 +942,15 @@ class AscendConfig:
         return bool(
             getattr(self, "enable_sparse_sfa_c8", False) or getattr(self, "enable_sparse_sfa_turboquant", False)
         )
+
+    def _validate_lm_head_quant(self, vllm_config: VllmConfig) -> None:
+        if not self.enable_lm_head_quant or is_draft_config_context():
+            return
+        model_config = vllm_config.model_config
+        if model_config is None or model_config.quantization != "ascend":
+            raise ValueError("enable_lm_head_quant requires ModelSlim quantization (--quantization ascend).")
+        if getattr(model_config.hf_text_config, "tie_word_embeddings", False):
+            raise ValueError("enable_lm_head_quant requires an LM head that does not share embedding weights.")
 
     def _validate_mc2_comm_alg(self, vllm_config: VllmConfig) -> None:
         from vllm_ascend.device.hardware_profile import get_current_hardware_profile
@@ -1749,6 +1764,23 @@ _ASCEND_CONFIG: AscendConfig | None = None
 # ``getattr(_ASCEND_CONFIG, "vllm_config", None) is vllm_config`` check, now
 # that vllm_config is no longer a member of AscendConfig.
 _INIT_VLLM_CONFIG: Any = None
+# Marks synchronous draft construction/loading for config and quantization decisions.
+# Nested scopes restore their caller's marker, including on failure.
+_DRAFT_CONFIG_CONTEXT: ContextVar[bool] = ContextVar("ascend_draft_config", default=False)
+
+
+def is_draft_config_context() -> bool:
+    return _DRAFT_CONFIG_CONTEXT.get()
+
+
+@contextmanager
+def draft_config_context() -> Iterator[None]:
+    """Identify draft reconstruction without changing configuration values."""
+    token = _DRAFT_CONFIG_CONTEXT.set(True)
+    try:
+        yield
+    finally:
+        _DRAFT_CONFIG_CONTEXT.reset(token)
 
 
 def _is_ascend_config_initialized(config: AscendConfig | None) -> bool:

@@ -42,7 +42,7 @@ from vllm.v1.spec_decode.utils import (
 )
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
-from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.ascend_config import draft_config_context, get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, set_ascend_forward_context
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
@@ -351,6 +351,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         if draft_vocab_size == target_vocab_size:
             draft_model.draft_id_to_target_id = None
 
+    @draft_config_context()
     def _get_model(self) -> nn.Module:
         """
         Default method to call get_model(). Can be overridden by subclasses which
