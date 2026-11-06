@@ -447,6 +447,8 @@ class AscendConfig:
             "msmonitor_use_daemon": false,
             "enable_transpose_kv_cache_by_block": true,
             "weight_nz_mode": 1,
+            "lm_head_quantization": null,
+            "draft_lm_head_quantization": null,
             "enable_shared_expert_dp": false,
             "enable_sparse_sfa_c8": false,
             "enable_sparse_li_c8": false,
@@ -585,6 +587,8 @@ class AscendConfig:
     enable_force_eplb: bool = False
     enable_pcp_o_proj_weight_sharding: bool = True
     enable_pcp_embedding_lmhead_weight_sharding: bool = True
+    lm_head_quantization: Literal["w8a8_dynamic"] | None = None
+    draft_lm_head_quantization: Literal["w8a8_dynamic"] | None = None
     draft_window_size: int | None = None
     mix_placement: bool = False
     # When non-zero, force the MC2 combine stage's comm quant_mode to this
@@ -686,6 +690,7 @@ class AscendConfig:
     # the max_num_batched_tokens that sequence-parallel writeback corrected).
     def derive_and_validate(self, vllm_config: VllmConfig) -> AscendConfig:
         vc = vllm_config
+        self._validate_lm_head_quantization(vc)
         engram_config = getattr(vc, "engram_config", None)
         if (
             engram_config is not None
@@ -936,6 +941,25 @@ class AscendConfig:
         return bool(
             getattr(self, "enable_sparse_sfa_c8", False) or getattr(self, "enable_sparse_sfa_turboquant", False)
         )
+
+    def _validate_lm_head_quantization(self, vllm_config: VllmConfig) -> None:
+        if self.lm_head_quantization is None and self.draft_lm_head_quantization is None:
+            return
+        model_config = vllm_config.model_config
+        is_draft = model_config is not None and model_config.runner_type == "draft"
+        models_to_validate = []
+        if self.lm_head_quantization is not None and not is_draft:
+            models_to_validate.append(("lm_head_quantization", model_config))
+        if self.draft_lm_head_quantization is not None:
+            draft_model_config = (
+                model_config if is_draft else getattr(vllm_config.speculative_config, "draft_model_config", None)
+            )
+            if draft_model_config is None:
+                raise ValueError("draft_lm_head_quantization requires model-based speculative decoding.")
+            models_to_validate.append(("draft_lm_head_quantization", draft_model_config))
+        for option, selected_model_config in models_to_validate:
+            if selected_model_config is None or selected_model_config.quantization != "ascend":
+                raise ValueError(f"{option} requires ModelSlim quantization for the selected model.")
 
     def _validate_mc2_comm_alg(self, vllm_config: VllmConfig) -> None:
         from vllm_ascend.device.hardware_profile import get_current_hardware_profile

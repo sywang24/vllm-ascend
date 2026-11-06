@@ -39,9 +39,14 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.linear import LinearBase
 from vllm.model_executor.layers.quantization import register_quantization_config
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig, QuantizeMethodBase
-from vllm.model_executor.layers.vocab_parallel_embedding import UnquantizedEmbeddingMethod, VocabParallelEmbedding
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    UnquantizedEmbeddingMethod,
+    VocabParallelEmbedding,
+)
 from vllm.model_executor.models.utils import WeightsMapper
 
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.utils import (
     ASCEND_QUANTIZATION_METHOD,
@@ -50,6 +55,7 @@ from vllm_ascend.utils import (
 )
 
 from ..methods import get_scheme_class
+from ..methods.w8a8.w8a8_dynamic_online import AscendW8A8DynamicOnlineLinearMethod
 from ..utils import is_fused_moe_layer
 
 _MOE_WEIGHT_LOADER_NAME_MAP = {
@@ -887,6 +893,30 @@ class AscendModelSlimConfig(QuantizationConfig):
             logger.debug("Select AscendFusedMoEMethod for %s (layer=%s)", prefix, "FusedMoE")
             return AscendFusedMoEMethod(scheme, layer.moe_config, tid2eid)
         elif isinstance(layer, VocabParallelEmbedding):
+            if isinstance(layer, ParallelLMHead):
+                ascend_config = get_ascend_config()
+                is_draft = vllm_config.model_config.runner_type == "draft"
+                option = "draft_lm_head_quantization" if is_draft else "lm_head_quantization"
+                requested_quantization = getattr(ascend_config, option)
+                if requested_quantization == "w8a8_dynamic":
+                    if quant_type not in (None, "W8A8_DYNAMIC"):
+                        raise ValueError(
+                            f"{option}={requested_quantization!r} conflicts with checkpoint quantization "
+                            f"{quant_type!r} for {runtime_prefix}."
+                        )
+                    if quant_type is None:
+                        model_config = (
+                            vllm_config.speculative_config.draft_model_config
+                            if is_draft and vllm_config.speculative_config is not None
+                            else vllm_config.model_config
+                        )
+                        if getattr(model_config.hf_text_config, "tie_word_embeddings", False):
+                            raise ValueError(f"{option} requires an LM head that does not share embedding weights.")
+                        logger.info_once(
+                            "Quantizing the unquantized %s LM head with online W8A8 dynamic quantization.",
+                            "draft" if is_draft else "target",
+                        )
+                        return AscendEmbeddingMethod(AscendW8A8DynamicOnlineLinearMethod())
             if quant_type is None:
                 logger.debug("Select UnquantizedEmbeddingMethod for %s (layer=%s)", prefix, "VocabParallelEmbedding")
                 return UnquantizedEmbeddingMethod()
