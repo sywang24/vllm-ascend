@@ -48,6 +48,7 @@ The following table lists additional configuration options available in vLLM Asc
 
 | Name                                | Type | Default | Description                                                                                               |
 |-------------------------------------|------|---------|-----------------------------------------------------------------------------------------------------------|
+| `nova_kv` | dict | `None` | Experimental Qwen3.5 compressed full-attention cache. See [NOVA-KV](../feature_guide/nova_kv.md). |
 | `xlite_graph_config`                | dict | `{}`    | Configuration options for Xlite graph mode                                                                |
 | `finegrained_tp_config`             | dict | `{}`    | Configuration options for fine-grained tensor parallelism. See [Fine-Grained Tensor Parallelism](../feature_guide/Fine_grained_TP.md). |
 | `ascend_compilation_config`         | dict | `{}`    | Configuration options for ascend compilation                                                              |
@@ -77,6 +78,7 @@ The following table lists additional configuration options available in vLLM Asc
 | `enable_mlapo`                      | bool | `True`  | Whether to enable MLAPO (Model Layer-wise Adaptive Parallel Optimization). The legacy `VLLM_ASCEND_ENABLE_MLAPO` environment variable is no longer supported. |
 | `mlapo_keep_prefill_weights`        | bool | `False` | When True, keep MLAPO prefill weights on NPU instead of freeing them on kv_consumer (decode-only D) nodes. D nodes have normal local-prefill paths (recompute / fallback / preempt) that crash when the weights are freed (issue #11882). Enable this to trade NPU memory for stability. |
 | `weight_nz_mode`                    | int  | `1`     | Weight NZ mode. `0` disables NZ, `1` enables NZ only for quantized weights, and `2` also enables NZ for BF16/FP16 weights when supported. The legacy `VLLM_ASCEND_ENABLE_NZ` environment variable is no longer supported. |
+| `enable_lm_head_quant`              | bool | `False` | Quantize an unquantized ModelSlim LM head to INT8 on NPU after loading. Requires untied BF16/FP16 weights. Separately loaded draft heads keep their checkpoint quantization. |
 | `enable_fused_mc2`                  | int  | `0`     | Fused MC2 configuration. `0` disables the fused path, `1` selects dispatch-FFN-combine, and `2` selects CANN MegaMoe when the model and parallel configuration support it. On A5, SiTU models require a CANN MegaMoe wrapper exposing `activation` and `activation_params`; both SiTU parameters are bound from the MoE configuration during initialization. The legacy `VLLM_ASCEND_ENABLE_FUSED_MC2` environment variable is no longer supported. |
 | `enable_transpose_kv_cache_by_block`| bool | `True`  | Whether to enable transpose KV cache by block. The legacy `VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK` environment variable is no longer supported. |
 | `enable_flashcomm1`                 | bool | `False` | Whether to enable SP MoE. See [Sequence Parallelism](../feature_guide/sequence_parallelism.md). |
@@ -89,6 +91,22 @@ The following table lists additional configuration options available in vLLM Asc
 | `combine_quant_mode`                | int  | `0`     | Fused MC2 configuration. This configuration will be passed as the `comm_quant_mode` argument for the `torch_npu.npu_moe_distribute_combine_v2` operator. Please refer to the operator documentation for the valid value range. |
 
 The details of each configuration option are as follows:
+
+**enable_lm_head_quant**
+
+Enable online W8A8 dynamic quantization for a floating-point `ParallelLMHead` in a ModelSlim checkpoint:
+
+```bash
+vllm serve /path/to/modelslim-model \
+  --quantization ascend \
+  --additional-config '{"enable_lm_head_quant": true}'
+```
+
+The option defaults to `false`. It requires an LM head with BF16 or FP16 weights that are not tied to the input embedding. Heads already quantized in the checkpoint retain their existing quantization scheme.
+
+Each tensor-parallel weight shard is quantized per output channel with `torch_npu.npu_dynamic_quant` after loading. Inference uses dynamic per-token activation quantization and the existing W8A8 quantized matrix multiplication path. This changes the logits numerically; evaluate model quality before enabling it for a deployment.
+
+The option does not change the quantization of separately constructed MTP or draft heads. If a speculative decoding method shares the target LM head, it also shares the quantized head.
 
 <span id="runtime_guard"></span>**runtime_guard**
 

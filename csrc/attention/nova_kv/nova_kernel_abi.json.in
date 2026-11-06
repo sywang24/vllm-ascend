@@ -1,0 +1,1 @@
+{"abi_version":1,"lut_dtype":"float16","tile_tokens":128,"max_split_tokens":1024,"head_dim":256,"max_query_groups":6}

@@ -39,9 +39,14 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.linear import LinearBase
 from vllm.model_executor.layers.quantization import register_quantization_config
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig, QuantizeMethodBase
-from vllm.model_executor.layers.vocab_parallel_embedding import UnquantizedEmbeddingMethod, VocabParallelEmbedding
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    UnquantizedEmbeddingMethod,
+    VocabParallelEmbedding,
+)
 from vllm.model_executor.models.utils import WeightsMapper
 
+from vllm_ascend.ascend_config import get_ascend_config, is_draft_config_context
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.utils import (
     ASCEND_QUANTIZATION_METHOD,
@@ -50,6 +55,7 @@ from vllm_ascend.utils import (
 )
 
 from ..methods import get_scheme_class
+from ..methods.w8a8.w8a8_dynamic_online import AscendW8A8DynamicOnlineLinearMethod
 from ..utils import is_fused_moe_layer
 
 _MOE_WEIGHT_LOADER_NAME_MAP = {
@@ -888,6 +894,14 @@ class AscendModelSlimConfig(QuantizationConfig):
             return AscendFusedMoEMethod(scheme, layer.moe_config, tid2eid)
         elif isinstance(layer, VocabParallelEmbedding):
             if quant_type is None:
+                if (
+                    isinstance(layer, ParallelLMHead)
+                    and not is_draft_config_context()
+                    and vllm_config.model_config.runner_type != "draft"
+                    and get_ascend_config().enable_lm_head_quant
+                ):
+                    logger.info_once("Quantizing the unquantized LM head with online W8A8 dynamic quantization.")
+                    return AscendEmbeddingMethod(AscendW8A8DynamicOnlineLinearMethod())
                 logger.debug("Select UnquantizedEmbeddingMethod for %s (layer=%s)", prefix, "VocabParallelEmbedding")
                 return UnquantizedEmbeddingMethod()
             scheme = create_scheme_for_layer(quant_type, prefix, "linear")

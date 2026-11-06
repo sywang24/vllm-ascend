@@ -131,6 +131,7 @@ from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAtt
 from vllm_ascend.attention.context_parallel.sfa_cp import AscendSFADCPMetadataBuilder
 from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder
 from vllm_ascend.attention.mla_v1 import AscendMLABackend
+from vllm_ascend.attention.nova_request_state import NovaRequestState
 from vllm_ascend.attention.utils import (
     MLA_FLASH_SUPPORTED_Q_HEADS,
     AscendCommonAttentionMetadata,
@@ -425,6 +426,12 @@ class NPUModelRunner(GPUModelRunner):
 
         self.max_num_tokens = self.scheduler_config.max_num_batched_tokens
         self.max_num_reqs = self.scheduler_config.max_num_seqs
+        nova_options = (vllm_config.additional_config or {}).get("nova_kv") or {}
+        self._nova_request_state = NovaRequestState(self.max_num_reqs) if nova_options.get("artifact_path") else None
+        self._nova_request_slots = (
+            self._make_buffer(self.max_num_reqs, dtype=torch.int64) if self._nova_request_state else None
+        )
+        self._nova_request_slots_cpu = None
         self.dp_size = vllm_config.parallel_config.data_parallel_size
         self.dp_rank = vllm_config.parallel_config.data_parallel_rank
 
@@ -999,6 +1006,10 @@ class NPUModelRunner(GPUModelRunner):
         ).unsqueeze(1)
 
     def _update_states(self, scheduler_output: "SchedulerOutput") -> Callable | None:
+        if self._nova_request_state is not None:
+            self._nova_request_state.release(
+                scheduler_output.finished_req_ids | (scheduler_output.preempted_req_ids or set())
+            )
         self._update_replay_requests(scheduler_output)
         # Temporary rewind guard for KV-load-failure recompute.
         # This can be removed after the upstream fix is merged.
@@ -2471,6 +2482,14 @@ class NPUModelRunner(GPUModelRunner):
                     return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
                 self._start_dump_data(scheduled_tokens = scheduler_output.num_scheduled_tokens)
                 num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
+                if self._nova_request_state is not None:
+                    slots = self._nova_request_state.prepare(
+                        req_ids, self.input_batch.num_computed_tokens_cpu[:num_reqs], num_scheduled_tokens_np
+                    )
+                    self._nova_request_slots_cpu = slots
+                    self._nova_request_slots.np.fill(-1)
+                    self._nova_request_slots.np[:num_reqs] = slots
+                    self._nova_request_slots.copy_to_gpu()
                 max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
                 (
                     logits_indices,
@@ -3963,6 +3982,10 @@ class NPUModelRunner(GPUModelRunner):
             query_start_loc=self.query_start_loc.gpu[: num_reqs_padded + 1],
             query_start_loc_cpu=self.query_start_loc.cpu[: num_reqs_padded + 1],
             seq_lens=self.seq_lens[:num_reqs_padded],
+            nova_request_slots=(
+                self._nova_request_slots.gpu[:num_reqs_padded] if self._nova_request_slots is not None else None
+            ),
+            nova_request_slots_cpu=self._nova_request_slots_cpu,
             # Always pass optimistic_seq_lens_cpu via _seq_lens_cpu so NPU
             # attention backends can get CPU seq_lens without GPU->CPU sync.
             # This is separate from seq_lens_cpu (None in async) which eagle
@@ -4460,6 +4483,13 @@ class NPUModelRunner(GPUModelRunner):
                         # slots, so stale active entries must not write caches.
                         blk_table = self.input_batch.block_table[kv_cache_gid]
                         blk_table.slot_mapping.gpu[:num_tokens_padded].fill_(-1)
+
+                if self._nova_request_slots is not None:
+                    self._nova_request_slots.np.fill(-1)
+                    self._nova_request_slots.copy_to_gpu()
+                    self._nova_request_slots_cpu = [-1] * num_reqs_padded
+                    for group in self.input_batch.block_table.block_tables:
+                        group.slot_mapping.gpu[:num_tokens_padded].fill_(-1)
 
                 pad_attn = cudagraph_runtime_mode == CUDAGraphMode.FULL
                 # check how to build dummy
@@ -5808,6 +5838,14 @@ class NPUModelRunner(GPUModelRunner):
                     group_kernel_block_size or current_kv_cache_spec.block_size
                 )
 
+                if getattr(attn_backend, "uses_nova_kv_cache", False):
+                    # The upstream reshape hook assumes dense K/V planes. NOVA
+                    # aliases packed bytes while retaining allocator page gaps.
+                    kv_caches[layer_name] = attn_backend.reshape_cache(
+                        kv_cache_raw_tensors[layer_name], current_kv_cache_spec, kernel_block_size
+                    )
+                    continue
+
                 if self._is_c8_mxfp_kv_cache(current_kv_cache_spec):
                     raw = kv_cache_raw_tensors[layer_name]
                     if not isinstance(raw, torch.Tensor):
@@ -6685,7 +6723,8 @@ class NPUModelRunner(GPUModelRunner):
                     if self._is_c8_mxfp_kv_cache(spec):
                         spec = mxfp_cache_spec(spec)
                     kv_cache_spec[layer_name] = spec
-                    attn_layer_names.add(layer_name)
+                    if getattr(attn_module, "align_kv_cache_with_mamba", True):
+                        attn_layer_names.add(layer_name)
             elif isinstance(attn_module, MLAAttention):
                 if self.use_sparse or getattr(
                     getattr(attn_module, "impl", None), "enable_sparse_sfa_c8", False
