@@ -1,0 +1,7 @@
+# Rename to the PR number when submitting upstream.
+pr: 0
+entries:
+  - category: feature
+    text: Added experimental opt-in NOVA-KV compressed full-attention history for Qwen3.5 dense text models on Ascend with Model Runner V1 and V2, including decode graph replay and automatic exact-window recovery with synchronous scheduling.
+  - category: bugfix
+    text: Fixed NOVA-KV compressed cache page addressing above 4 GiB in the standalone kernel. Rebuild the kernel to enable 64-bit page offsets; the V2 backend rejects oversized allocations with older libraries.

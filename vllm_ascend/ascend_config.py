@@ -62,6 +62,36 @@ def validate_additional_config_bool(value: Any, path: str) -> bool:
 
 
 @config(config=ConfigDict(frozen=True))
+class NovaKVConfig:
+    """Experimental Qwen3.5 compressed full-attention configuration."""
+
+    artifact_path: str | None = None
+    capture_path: str | None = None
+    direct_library_root: str | None = None
+    sink_tokens: int = 192
+    recent_tokens: int = 256
+    codec_batch_size: int = 256
+    sample_tokens: int = 8192
+    direct_split_tokens: int = 1024
+    prefill_query_tile: int = 2048
+    prefill_kv_tile: int = 2048
+
+    def __post_init__(self):
+        if bool(self.artifact_path) == bool(self.capture_path):
+            raise ValueError("nova_kv requires exactly one of artifact_path and capture_path")
+        if self.artifact_path and not self.direct_library_root:
+            raise ValueError("nova_kv requires direct_library_root for compressed attention")
+        if self.sink_tokens < 0 or self.recent_tokens < 1:
+            raise ValueError("nova_kv requires sink_tokens >= 0 and recent_tokens >= 1")
+        if min(self.codec_batch_size, self.sample_tokens, self.prefill_kv_tile) < 1:
+            raise ValueError("nova_kv batch, sample and KV tile sizes must be positive")
+        if not 1 <= self.prefill_query_tile <= 2048:
+            raise ValueError("nova_kv prefill_query_tile must be between 1 and 2048")
+        if self.direct_split_tokens not in (128, 256, 512, 1024):
+            raise ValueError("nova_kv direct_split_tokens must be 128, 256, 512 or 1024")
+
+
+@config(config=ConfigDict(frozen=True))
 class KVPPConfig:
     """Configuration for KV layer parallelism on Ascend."""
 
@@ -567,6 +597,7 @@ class AscendConfig:
 
     # ---- user-input switches: bool/int/list/str, auto type validation ----
     enable_cpu_binding: bool = True
+    nova_kv: NovaKVConfig | None = None
     multistream_dsv4_dsa_overlap: bool = True
     # Prepare Engram hashes, lookups and DP/TP exchanges on an auxiliary stream;
     # FULL graphs wait on descriptor-specific external events at consumers.

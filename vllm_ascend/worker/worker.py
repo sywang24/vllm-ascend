@@ -159,6 +159,9 @@ NPUModelRunner = _V1ModelRunnerFactory()
 
 
 class NPUWorker(WorkerBase):
+    def get_missing_nova_windows(self, request_ids, computed_tokens):
+        return self.model_runner._nova_request_state.missing(request_ids, computed_tokens)
+
     def __init__(
         self,
         vllm_config: VllmConfig,

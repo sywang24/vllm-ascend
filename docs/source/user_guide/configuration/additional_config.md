@@ -48,6 +48,7 @@ The following table lists additional configuration options available in vLLM Asc
 
 | Name                                | Type | Default | Description                                                                                               |
 |-------------------------------------|------|---------|-----------------------------------------------------------------------------------------------------------|
+| `nova_kv` | dict | `None` | Experimental Qwen3.5 compressed full-attention cache. See [NOVA-KV](../feature_guide/nova_kv.md). |
 | `xlite_graph_config`                | dict | `{}`    | Configuration options for Xlite graph mode                                                                |
 | `finegrained_tp_config`             | dict | `{}`    | Configuration options for fine-grained tensor parallelism. See [Fine-Grained Tensor Parallelism](../feature_guide/Fine_grained_TP.md). |
 | `ascend_compilation_config`         | dict | `{}`    | Configuration options for ascend compilation                                                              |

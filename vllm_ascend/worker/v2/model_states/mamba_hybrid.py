@@ -472,6 +472,8 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
             num_accepted_tokens=num_accepted_tokens,
             num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
         )
+        nova_runtime = getattr(self, "nova_kv", None)
+        nova_metadata = nova_runtime.prepare(input_batch, num_reqs, for_capture=for_capture) if nova_runtime else {}
         return build_attn_metadata(
             attn_groups=attn_groups,
             num_reqs=num_reqs,
@@ -495,4 +497,5 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
             model_specific_attn_metadata=model_specific_metadata,
             pcp_context=pcp_context,
             for_cudagraph_capture=for_capture,
+            **nova_metadata,
         )
