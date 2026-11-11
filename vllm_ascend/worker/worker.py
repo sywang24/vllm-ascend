@@ -665,6 +665,62 @@ class NPUWorker(WorkerBase):
         )
         return self._apply_kvpp_memory_budget(self.available_kv_cache_memory_bytes)
 
+    def _scale_dquant_kv_budget(self, available_memory: int) -> int:
+        dense_reference = envs_ascend.VLLM_ASCEND_DQUANT_DENSE_REFERENCE
+        if not envs_ascend.VLLM_ASCEND_ENABLE_DQUANT and not dense_reference:
+            return available_memory
+        from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
+        from vllm.v1.kv_cache_interface import KVCacheTensor, UniformTypeKVCacheSpecs
+
+        if "layers" not in getattr(KVCacheTensor, "__dataclass_fields__", {}):
+            return available_memory
+        groups = get_kv_cache_groups(self.vllm_config, self.get_kv_cache_spec())
+        from vllm_ascend.core.kv_cache_interface import DQuantAttentionSpec
+
+        recent_bytes = 0
+        for group in groups:
+            for name in group.layer_names:
+                spec = group.kv_cache_spec
+                if isinstance(spec, UniformTypeKVCacheSpecs):
+                    spec = spec.kv_cache_specs[name]
+                if isinstance(spec, DQuantAttentionSpec):
+                    recent_bytes += spec.recent_state_bytes
+        recent_bytes *= getattr(getattr(self.vllm_config, "scheduler_config", None), "max_num_seqs", 1)
+        if recent_bytes >= available_memory:
+            raise ValueError("D-Quant recent window reservation exceeds available KV memory")
+        if recent_bytes:
+            logger.info("D-Quant reserves %d bytes for raw recent KV state", recent_bytes)
+            available_memory -= recent_bytes
+
+        def layer_spec(group, name):
+            group_spec = group.kv_cache_spec
+            if isinstance(group_spec, UniformTypeKVCacheSpecs):
+                return group_spec.kv_cache_specs[name]
+            return group_spec
+
+        # Scheduler groups alias a padded arena, while this backend allocates
+        # private contiguous buffers. Convert physical bytes to the planner's
+        # virtual arena without charging either attention or Mamba padding.
+        planner_group_sizes = []
+        physical_group_sizes = []
+        for group in groups:
+            specs = [layer_spec(group, name) for name in group.layer_names]
+            planner_group_sizes.append(sum(spec.page_size_bytes for spec in specs))
+            physical_group_sizes.append(sum(spec.real_page_size_bytes for spec in specs))
+        total = sum(physical_group_sizes)
+        if not total:
+            return available_memory
+        scaled = available_memory * max(planner_group_sizes) // total
+        logger.info(
+            "D-Quant physical KV budget %d bytes maps to %d planner bytes; "
+            "physical bytes/block=%d, padded private bytes/block=%d",
+            available_memory,
+            scaled,
+            total,
+            sum(planner_group_sizes),
+        )
+        return scaled
+
     def _scale_kv_cache_memory_for_multi_group(self, available_memory: int) -> int:
         """Scale the KV cache budget for vllm main's multi-group layout.
 
@@ -677,6 +733,8 @@ class NPUWorker(WorkerBase):
         derives a num_blocks (and block pool) small enough for the per-layer
         buffers to fit.
         """
+        if envs_ascend.VLLM_ASCEND_ENABLE_DQUANT or envs_ascend.VLLM_ASCEND_DQUANT_DENSE_REFERENCE:
+            return self._scale_dquant_kv_budget(available_memory)
         kv_cache_spec = self.get_kv_cache_spec()
         if not isinstance(kv_cache_spec, dict):
             return available_memory
@@ -863,6 +921,63 @@ class NPUWorker(WorkerBase):
 
         with context, set_current_vllm_config(self.vllm_config):
             self.model_runner.load_model()
+
+        if (
+            envs_ascend.VLLM_ASCEND_ENABLE_DQUANT
+            and self.vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.FULL_DECODE_ONLY
+        ):
+            from vllm_ascend.ops.triton.dquant_decode_pool import DQuantGraphWorkspace
+
+            workspace = DQuantGraphWorkspace(
+                self.vllm_config.scheduler_config.max_num_seqs, self.model_config.max_model_len
+            )
+            model = self.model_runner.get_model()
+            for module in model.modules():
+                impl = getattr(module, "impl", None)
+                if hasattr(impl, "_dquant_cache"):
+                    impl._dquant_graph_workspace = workspace
+            model._dquant_graph_workspace = workspace
+
+        if envs_ascend.VLLM_ASCEND_ENABLE_DQUANT and envs_ascend.VLLM_ASCEND_DQUANT_DECODE_WORKSPACE:
+            from vllm_ascend.attention.dquant_attention import install_dquant_decode_workspace
+
+            if self.model_config.enforce_eager:
+                install_dquant_decode_workspace(self.model_runner.get_model())
+
+        if (
+            envs_ascend.VLLM_ASCEND_ENABLE_DQUANT
+            and (envs_ascend.VLLM_ASCEND_DQUANT_SEGMENT_GRAPH or envs_ascend.VLLM_ASCEND_DQUANT_ATTENTION_GRAPH)
+            and self.model_config.enforce_eager
+            and self.vllm_config.lora_config is None
+            and self.vllm_config.speculative_config is None
+            and self.vllm_config.kv_transfer_config is None
+            and self.vllm_config.weight_transfer_config is None
+            and not self.model_config.enable_sleep_mode
+        ):
+            if envs_ascend.VLLM_ASCEND_DQUANT_SEGMENT_GRAPH:
+                from vllm_ascend.ops.dquant_segment_graph import install_dquant_segment_graphs
+
+                segments = install_dquant_segment_graphs(self.model_runner.get_model())
+                logger.info("Installed %d experimental D-Quant GDN decoder segments", len(segments))
+            if envs_ascend.VLLM_ASCEND_DQUANT_ATTENTION_GRAPH:
+                from vllm_ascend.ops.dquant_attention_graph import install_dquant_attention_graphs
+
+                graphs = install_dquant_attention_graphs(self.model_runner.get_model())
+                logger.info("Installed %d experimental D-Quant attention decoder graph pairs", len(graphs))
+            if (
+                envs_ascend.VLLM_ASCEND_DQUANT_BOUNDARY_GRAPH
+                and envs_ascend.VLLM_ASCEND_DQUANT_SEGMENT_GRAPH
+                and envs_ascend.VLLM_ASCEND_DQUANT_ATTENTION_GRAPH
+                and (
+                    self.model_config.multimodal_config is None
+                    or self.model_config.multimodal_config.language_model_only
+                )
+                and self.parallel_config.pipeline_parallel_size == 1
+            ):
+                from vllm_ascend.ops.dquant_boundary_graph import install_dquant_boundary_graphs
+
+                chains = install_dquant_boundary_graphs(self.model_runner.get_model())
+                logger.info("Installed %d experimental D-Quant decoder graph chains", len(chains))
 
         if self.vllm_config.weight_transfer_config is not None:
             from vllm.distributed.weight_transfer.factory import (

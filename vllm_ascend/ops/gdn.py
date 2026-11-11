@@ -37,6 +37,7 @@ from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata  # typ
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
+from vllm_ascend import envs
 from vllm_ascend.attention.utils import (
     maybe_save_kv_layer_to_connector,
     wait_for_kv_layer_from_connector,
@@ -52,6 +53,85 @@ from vllm_ascend.ops.triton.mamba.causal_conv1d import extract_last_width
 from vllm_ascend.ops.triton.mamba.state_index import gather_ssm_states, scatter_ssm_states_
 
 _PACKED_CONV_WEIGHT_NAME = "ascend_conv1d_weight"
+
+
+def _causal_conv1d(
+    output,
+    x,
+    weight,
+    *,
+    conv_state,
+    bias_opt=None,
+    query_start_loc_opt=None,
+    cache_indices_opt=None,
+    initial_state_mode_opt=None,
+    num_accepted_tokens_opt=None,
+    activation_mode=0,
+    pad_slot_id=PAD_SLOT_ID,
+    run_mode=0,
+    max_query_len=1,
+):
+    """Dispatch the optional graph adapter across supported operator versions."""
+    if hasattr(torch.ops._C_ascend, "npu_causal_conv1d_custom"):
+        return torch.ops._C_ascend.npu_causal_conv1d_custom(
+            output,
+            x,
+            weight,
+            conv_state=conv_state,
+            bias_opt=bias_opt,
+            query_start_loc_opt=query_start_loc_opt,
+            cache_indices_opt=cache_indices_opt,
+            initial_state_mode_opt=initial_state_mode_opt,
+            num_accepted_tokens_opt=num_accepted_tokens_opt,
+            activation_mode=activation_mode,
+            pad_slot_id=pad_slot_id,
+            run_mode=run_mode,
+        )
+    weight = weight.to(dtype=x.dtype).contiguous()
+    if cache_indices_opt is not None:
+        if cache_indices_opt.ndim == 2:
+            cache_indices_opt = cache_indices_opt[:, 0]
+        elif cache_indices_opt.ndim != 1:
+            raise ValueError("GDN convolution cache indices must be one- or two-dimensional")
+        cache_indices_opt = cache_indices_opt.contiguous()
+    activation = "silu" if activation_mode else None
+    if run_mode == 0:
+        result = causal_conv1d_fn(
+            x,
+            weight,
+            bias_opt,
+            conv_states=conv_state,
+            query_start_loc=query_start_loc_opt,
+            cache_indices=cache_indices_opt,
+            has_initial_state=initial_state_mode_opt,
+            activation=activation,
+            pad_slot_id=pad_slot_id,
+            null_block_id=0,
+        )
+        output.copy_(result)
+        return output
+    if run_mode != 1:
+        raise ValueError(f"Unsupported GDN convolution run mode: {run_mode}")
+    return causal_conv1d_update(
+        x,
+        conv_state,
+        weight,
+        bias=bias_opt,
+        activation=activation,
+        conv_state_indices=cache_indices_opt,
+        num_accepted_tokens=num_accepted_tokens_opt,
+        query_start_loc=query_start_loc_opt,
+        max_query_len=max_query_len,
+        null_block_id=0,
+        out=output,
+    )
+
+
+def _recurrent_gated_delta_rule(**kwargs):
+    """Preserve the graph adapter's in-place state updates across versions."""
+    if hasattr(torch.ops._C_ascend, "npu_recurrent_gated_delta_rule"):
+        return torch.ops._C_ascend.npu_recurrent_gated_delta_rule(**kwargs)
+    return recurrent_gated_delta_rule(**kwargs)
 
 
 @lru_cache(maxsize=1)
@@ -449,6 +529,31 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             output[:num_tokens] = out
         return out
 
+    def _try_dquant_decode_graph(self, context, metadata, mixed_qkv, b, a, output):
+        enabled = getattr(self, "_dquant_gdn_graph_enabled", None)
+        if enabled is None:
+            enabled = envs.VLLM_ASCEND_ENABLE_DQUANT and envs.VLLM_ASCEND_DQUANT_GDN_GRAPH
+            self._dquant_gdn_graph_enabled = enabled
+        if not enabled:
+            return False
+        from vllm_ascend.ops.gdn_decode_graph import SingleTokenGDNGraph
+
+        if not SingleTokenGDNGraph.supports(self, metadata, mixed_qkv, b, a):
+            return False
+        graph = getattr(self, "_dquant_decode_graph", None)
+        if graph is None:
+            pool = context.additional_kwargs.get("dquant_gdn_graph_pool")
+            if pool is None:
+                pool = torch.npu.graph_pool_handle()
+                context.additional_kwargs["dquant_gdn_graph_pool"] = pool
+            graph = SingleTokenGDNGraph(self, mixed_qkv[:1], b[:1], a[:1], metadata, pool=pool)
+            self._dquant_decode_graph = graph
+        elif not graph.matches(mixed_qkv[:1], b[:1], a[:1], metadata):
+            return False
+        graph.replay(mixed_qkv[:1], b[:1], a[:1], metadata, output)
+        maybe_save_kv_layer_to_connector("", [])
+        return True
+
     def _forward_core(
         self,
         mixed_qkv: torch.Tensor,
@@ -477,6 +582,10 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         assert isinstance(attn_metadata, dict)
         attn_metadata = attn_metadata[self.prefix]
         assert isinstance(attn_metadata, GDNAttentionMetadata)
+        if AscendGatedDeltaNetAttention._try_dquant_decode_graph(
+            self, forward_context, attn_metadata, mixed_qkv, b, a, core_attn_out
+        ):
+            return
         spec_sequence_masks = attn_metadata.spec_sequence_masks
         spec_token_indx = attn_metadata.spec_token_indx
         non_spec_token_indx = attn_metadata.non_spec_token_indx

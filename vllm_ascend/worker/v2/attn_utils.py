@@ -199,6 +199,10 @@ def _align_hybrid_attention_page_sizes(kv_cache_specs: dict[str, KVCacheSpec]) -
 
 def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
     """Build Ascend-specific KV cache specs for v2 worker patching."""
+    from vllm_ascend.core.kv_cache_interface import dquant_enabled
+
+    if dquant_enabled(vllm_config):
+        raise NotImplementedError("D-Quant is currently implemented for model runner v1 only.")
     from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
 
     use_turboquant = vllm_config.cache_config.cache_dtype == TURBOQUANT_CACHE_DTYPE

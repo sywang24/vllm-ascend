@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import math
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
 
 import torch
 from typing_extensions import Self
-from vllm.config import VllmConfig
+from vllm.compilation import breakable_cudagraph
+from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager, SlidingWindowManager
@@ -21,6 +23,267 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
+
+from vllm_ascend import envs
+
+
+def dquant_enabled(vllm_config: VllmConfig | None = None) -> bool:
+    """Return whether the experimental D-Quant cache format was requested.
+
+    The switch is intentionally environment based until vLLM grows a public
+    cache-format option.  Keeping the default off prevents a compressed cache
+    from being handed to an unmodified attention backend.
+    """
+    del vllm_config
+    return envs.VLLM_ASCEND_ENABLE_DQUANT
+
+
+def require_dquant_attention_backend(vllm_config: VllmConfig | None = None) -> None:
+    """Reject unvalidated execution modes before cache allocation."""
+    if vllm_config is None:
+        raise RuntimeError("D-Quant configuration is missing; KV cache allocation has not started.")
+    breakable_piecewise = False
+    full_decode = (
+        not vllm_config.model_config.enforce_eager
+        and vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.FULL_DECODE_ONLY
+    )
+    if not vllm_config.model_config.enforce_eager:
+        breakable_piecewise = (
+            breakable_cudagraph.is_breakable_cudagraph_enabled()
+            and vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.PIECEWISE
+        )
+    if not vllm_config.model_config.enforce_eager and not (breakable_piecewise or full_decode):
+        raise RuntimeError(
+            "D-Quant requires eager, breakable PIECEWISE, or FULL_DECODE_ONLY execution; "
+            "KV cache allocation has not started."
+        )
+    parallel = vllm_config.parallel_config
+    if full_decode and (
+        not envs.VLLM_ASCEND_DQUANT_FUSED_ATTENTION
+        or envs.VLLM_ASCEND_DQUANT_SYMBOL_CACHE
+        or envs.VLLM_ASCEND_DQUANT_KEY_WINDOW != 64
+        or envs.VLLM_ASCEND_DQUANT_RECENT_WINDOW != 128
+        or vllm_config.model_config.get_num_kv_heads(parallel) != 2
+        or vllm_config.model_config.get_head_size() != 256
+    ):
+        raise RuntimeError(
+            "D-Quant FULL_DECODE_ONLY requires fused rANS, two KV heads, head_size=256, recent=128, key_window=64"
+        )
+    # Tensor parallelism is supported: each rank owns a contiguous shard of the
+    # KV heads, so the per-token record shrinks with the local stream length.
+    # PP/PCP/DCP still replicate scheduler-visible token ids and are rejected.
+    if any(
+        getattr(parallel, name, 1) != 1
+        for name in (
+            "pipeline_parallel_size",
+            "prefill_context_parallel_size",
+            "decode_context_parallel_size",
+        )
+    ):
+        raise RuntimeError("The D-Quant eager bridge supports TP but not PP/PCP/DCP.")
+    if vllm_config.kv_transfer_config is not None or vllm_config.speculative_config is not None:
+        raise RuntimeError("D-Quant does not yet support KV transfer or speculative decoding.")
+    if vllm_config.quant_config is not None or vllm_config.cache_config.cache_dtype != "auto":
+        raise RuntimeError("D-Quant requires unquantized model weights and cache_dtype=auto.")
+    if envs.VLLM_ASCEND_DQUANT_RECENT_WINDOW or envs.VLLM_ASCEND_DQUANT_KEY_WINDOW:
+        if vllm_config.cache_config.enable_prefix_caching:
+            raise RuntimeError("D-Quant window state currently requires enable_prefix_caching=False.")
+        if getattr(parallel, "enable_dbo", False):
+            raise RuntimeError("D-Quant window state does not support dual batch overlap.")
+
+
+# Reference record sizes from the paper: a 1024-value stream uses a 331-byte Key
+# container (2.59 bit/value) and a 231-byte Value container (1.81 bit/value).
+# With tensor parallelism the local stream shrinks, so the fixed container must
+# shrink proportionally to keep the same effective bit rate.
+_REFERENCE_STREAM_LENGTH = 1024
+_KEY_CONTAINER_BYTES_PER_VALUE = 331 / _REFERENCE_STREAM_LENGTH
+_VALUE_CONTAINER_BYTES_PER_VALUE = 231 / _REFERENCE_STREAM_LENGTH
+
+
+def dquant_container_bytes(stream_length: int) -> tuple[int, int]:
+    """Scale the paper container sizes to one rank-local KV head shard."""
+    if stream_length <= 0:
+        raise ValueError("D-Quant stream length must be positive")
+    key = max(8, int(round(stream_length * _KEY_CONTAINER_BYTES_PER_VALUE)))
+    value = max(8, int(round(stream_length * _VALUE_CONTAINER_BYTES_PER_VALUE)))
+    return key | 1, value | 1
+
+
+@dataclass(frozen=True, kw_only=True)
+class DQuantAttentionSpec(FullAttentionSpec):
+    """Paged D-Quant layout for one dense full-attention layer.
+
+    One scheduler token maps to one K and one V fixed-size rANS record.  The
+    record contains an even-padded payload and two FP16 values (scale/offset),
+    so ``real_page_size_bytes`` is the compact physical page size.  The class
+    deliberately remains a ``FullAttentionSpec`` subclass: scheduling,
+    prefix-cache hashing and block allocation keep their normal semantics while
+    the Ascend worker can select a D-Quant-aware allocator/backend.
+    """
+
+    dquant_key_container_bytes: int = 331
+    dquant_value_container_bytes: int = 231
+    dquant_key_levels: int = 8
+    dquant_value_levels: int = 6
+    dquant_alpha: float = 1.4
+    dquant_recent_window: int = 0
+    dquant_key_window: int = 0
+    dquant_stream_length: int | None = None
+    dquant_symbol_cache: bool = False
+
+    def __post_init__(self):
+        super().__post_init__()
+        for label, levels in (("key", self.dquant_key_levels), ("value", self.dquant_value_levels)):
+            if not isinstance(levels, int) or not 2 <= levels <= 256:
+                raise ValueError(f"D-Quant {label} levels must be an integer between 2 and 256")
+        for label, size in (
+            ("key", self.dquant_key_container_bytes),
+            ("value", self.dquant_value_container_bytes),
+        ):
+            if not isinstance(size, int) or size < 4:
+                raise ValueError(f"D-Quant {label} payload must contain the 4-byte rANS state")
+        if not math.isfinite(self.dquant_alpha) or self.dquant_alpha <= 0:
+            raise ValueError("D-Quant alpha must be finite and positive")
+        if self.dquant_recent_window < 0 or self.dquant_key_window < 0:
+            raise ValueError("D-Quant windows must be nonnegative")
+        if self.dquant_key_window and self.block_size % self.dquant_key_window:
+            raise ValueError("D-Quant key window must divide the physical block size")
+        if self.dquant_symbol_cache and (
+            max(self.dquant_key_levels, self.dquant_value_levels) > 16
+            or self.stream_length % 2
+            or self.dquant_key_window % 16
+            or not self.dquant_key_window
+            or self.mean_stripe_bytes % 4
+        ):
+            raise ValueError(
+                "Symbol cache needs <=16 levels, even streams, 16-aligned windows and four-byte mean stripes"
+            )
+
+    @property
+    def uses_window_state(self) -> bool:
+        return bool(self.dquant_recent_window or self.dquant_key_window)
+
+    @property
+    def mean_stripe_bytes(self) -> int:
+        if not self.dquant_key_window:
+            return 0
+        size = self.stream_length * get_dtype_size(self.dtype)
+        return 2 * cdiv(size, 2 * self.dquant_key_window)
+
+    @property
+    def recent_capacity(self) -> int:
+        return self.dquant_recent_window + max(1, self.dquant_key_window) - 1
+
+    @property
+    def recent_state_bytes(self) -> int:
+        return (self.recent_capacity + 1) * (2 * self.stream_length * get_dtype_size(self.dtype) + 8) + 4
+
+    @property
+    def stream_length(self) -> int:
+        return self.dquant_stream_length or (self.num_kv_heads * self.head_size)
+
+    @property
+    def key_record_bytes(self) -> int:
+        return ((self.dquant_key_container_bytes + 1) & ~1) + 4 + self.mean_stripe_bytes + self.symbol_bytes
+
+    @property
+    def value_record_bytes(self) -> int:
+        return ((self.dquant_value_container_bytes + 1) & ~1) + 4 + self.symbol_bytes
+
+    @property
+    def symbol_bytes(self) -> int:
+        return self.stream_length // 2 if self.dquant_symbol_cache else 0
+
+    @property
+    def key_page_size_bytes(self) -> int:
+        return self.block_size * self.key_record_bytes
+
+    @property
+    def value_page_size_bytes(self) -> int:
+        return self.block_size * self.value_record_bytes
+
+    @property
+    def real_page_size_bytes(self) -> int:
+        return self.key_page_size_bytes + self.value_page_size_bytes
+
+    @property
+    def page_size_bytes(self) -> int:
+        return max(self.real_page_size_bytes, self.page_size_padded or 0)
+
+    @classmethod
+    def from_spec(cls, spec: FullAttentionSpec) -> "DQuantAttentionSpec":
+        """Convert a regular full-attention spec without changing its block size."""
+        if spec.head_size_v not in (None, spec.head_size):
+            raise ValueError("D-Quant KV records currently require equal key and value head sizes.")
+        stream_length = spec.num_kv_heads * spec.head_size
+        key_container_bytes, value_container_bytes = dquant_container_bytes(stream_length)
+        if envs.VLLM_ASCEND_DQUANT_KEY_BYTES < 0 or envs.VLLM_ASCEND_DQUANT_VALUE_BYTES < 0:
+            raise ValueError("D-Quant payload overrides must be nonnegative; zero selects the default")
+        if envs.VLLM_ASCEND_DQUANT_KEY_BYTES:
+            key_container_bytes = envs.VLLM_ASCEND_DQUANT_KEY_BYTES | 1
+        if envs.VLLM_ASCEND_DQUANT_VALUE_BYTES:
+            value_container_bytes = envs.VLLM_ASCEND_DQUANT_VALUE_BYTES | 1
+        return cls(
+            block_size=spec.block_size,
+            num_kv_heads=spec.num_kv_heads,
+            head_size=spec.head_size,
+            dtype=spec.dtype,
+            kv_quant_mode=spec.kv_quant_mode,
+            # The base spec may carry a dense-page override. D-Quant's physical
+            # allocation is determined by its fixed record sizes instead.
+            page_size_padded=None,
+            head_size_v=spec.head_size_v,
+            sliding_window=spec.sliding_window,
+            attention_chunk_size=spec.attention_chunk_size,
+            non_causal=spec.non_causal,
+            dquant_stream_length=stream_length,
+            dquant_key_container_bytes=key_container_bytes,
+            dquant_value_container_bytes=value_container_bytes,
+            dquant_key_levels=envs.VLLM_ASCEND_DQUANT_KEY_LEVELS,
+            dquant_value_levels=envs.VLLM_ASCEND_DQUANT_VALUE_LEVELS,
+            dquant_alpha=envs.VLLM_ASCEND_DQUANT_ALPHA,
+            dquant_recent_window=envs.VLLM_ASCEND_DQUANT_RECENT_WINDOW,
+            dquant_key_window=envs.VLLM_ASCEND_DQUANT_KEY_WINDOW,
+            dquant_symbol_cache=envs.VLLM_ASCEND_DQUANT_SYMBOL_CACHE,
+        )
+
+    @classmethod
+    def merge(cls, specs: list[Self]) -> Self:
+        assert all(isinstance(spec, DQuantAttentionSpec) for spec in specs)
+        layout = {
+            (
+                spec.dquant_key_container_bytes,
+                spec.dquant_value_container_bytes,
+                spec.dquant_key_levels,
+                spec.dquant_value_levels,
+                spec.dquant_alpha,
+                spec.dquant_recent_window,
+                spec.dquant_key_window,
+                spec.dquant_stream_length,
+                spec.dquant_symbol_cache,
+            )
+            for spec in specs
+        }
+        assert len(layout) == 1, "D-Quant layers in one KV cache group must share one record layout."
+        merged = super().merge(specs)
+        first = specs[0]
+        return replace(
+            merged,
+            dquant_key_container_bytes=first.dquant_key_container_bytes,
+            dquant_value_container_bytes=first.dquant_value_container_bytes,
+            dquant_key_levels=first.dquant_key_levels,
+            dquant_value_levels=first.dquant_value_levels,
+            dquant_alpha=first.dquant_alpha,
+            dquant_recent_window=first.dquant_recent_window,
+            dquant_key_window=first.dquant_key_window,
+            dquant_stream_length=first.dquant_stream_length,
+            dquant_symbol_cache=first.dquant_symbol_cache,
+        )
+
+    def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
+        max_model_len = vllm_config.model_config.max_model_len
+        return ((max_model_len + self.block_size - 1) // self.block_size) * self.page_size_bytes
 
 
 def get_kv_cache_compression_ratio(kv_cache_spec: KVCacheSpec) -> int:
@@ -414,6 +677,11 @@ class AscendCircularBufferSpec(CircularBufferSpec):
 
 
 def register_ascend_kv_cache_specs() -> None:
+    KVCacheSpecRegistry.register(
+        kvcache_spec_cls=DQuantAttentionSpec,
+        manager_class=FullAttentionManager,
+        uniform_type_base_spec=FullAttentionSpec,
+    )
     from vllm_ascend.core.single_type_kv_cache_manager import AscendCircularBufferManager
     from vllm_ascend.models.glm5next.kv_cache import KpoolTailManager
 

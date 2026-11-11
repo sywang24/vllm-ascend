@@ -120,6 +120,7 @@ from vllm.v1.worker.utils import (
 )
 
 # yapf: enable
+from vllm_ascend import envs as envs_ascend
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_c8_mxfp import (
     AscendC8MXFPAttentionBackendImpl,
@@ -152,7 +153,12 @@ from vllm_ascend.compilation.acl_graph import (
     update_full_graph_params,
 )
 from vllm_ascend.compilation.breakable_aclgraph import BreakableACLGraphWrapper
-from vllm_ascend.core.kv_cache_interface import is_circular_kv_cache_spec
+from vllm_ascend.core.kv_cache_interface import (
+    DQuantAttentionSpec,
+    dquant_enabled,
+    is_circular_kv_cache_spec,
+    require_dquant_attention_backend,
+)
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h import get_prebound_copy_sfa_slots
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_cache_layout import (
@@ -570,6 +576,13 @@ class NPUModelRunner(GPUModelRunner):
         self.decode_threshold = 1 + (self.speculative_config.num_speculative_tokens if self.speculative_config else 0)
 
         self.use_aclgraph = self._use_aclgraph()
+
+        self._dquant_batch_slots = None
+        if (envs_ascend.VLLM_ASCEND_ENABLE_DQUANT
+                and vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.FULL_DECODE_ONLY):
+            from vllm_ascend.ops.triton.dquant_decode_pool import DQuantBatchSlots
+
+            self._dquant_batch_slots = DQuantBatchSlots(self.max_num_reqs, self.device)
 
         eplb_config = self.ascend_config.eplb_config
         self.dynamic_eplb = eplb_config.dynamic_eplb
@@ -991,6 +1004,14 @@ class NPUModelRunner(GPUModelRunner):
                 kv_cache_block_copies=[],
             )
         sampling_metadata = super()._update_states(scheduler_output)
+        dquant_released = scheduler_output.finished_req_ids | set(getattr(scheduler_output, "preempted_req_ids", ()))
+        if dquant_enabled() and dquant_released:
+            if self._dquant_batch_slots is not None:
+                self._dquant_batch_slots.release(dquant_released)
+            for layer in self.compilation_config.static_forward_context.values():
+                cache = getattr(getattr(layer, "impl", None), "_dquant_cache", None)
+                if cache is not None:
+                    cache.release(dquant_released)
         self._track_tmp_encoder_cache_refs(scheduler_output)
         return sampling_metadata
 
@@ -3256,6 +3277,10 @@ class NPUModelRunner(GPUModelRunner):
             if executor is not None and executor.submission_in_flight:
                 executor.release()
 
+        if self._dquant_batch_slots is not None and not forward_context.capturing:
+            workspace = getattr(self.get_model(), "_dquant_graph_workspace", None)
+            if workspace is not None:
+                workspace.check_errors()
         return hidden_states
 
     def _prepare_device_metadata_for_forward(
@@ -3814,6 +3839,20 @@ class NPUModelRunner(GPUModelRunner):
                 assert isinstance(attn_metadata, list)
                 attn_metadata_dict = attn_metadata[ubid]
 
+            dquant_spec = self.kv_cache_config.kv_cache_groups[kv_cache_gid].kv_cache_spec
+            if isinstance(dquant_spec, DQuantAttentionSpec):
+                if ubid is not None:
+                    raise NotImplementedError("D-Quant window metadata does not support microbatching")
+                attn_metadata_i.dquant_spec = dquant_spec
+                attn_metadata_i.dquant_request_ids = tuple(self.input_batch.req_ids[:num_reqs])
+                attn_metadata_i.dquant_active_request_ids = frozenset(self.requests)
+                if self._dquant_batch_slots is not None:
+                    batch_metadata, slots = self._dquant_batch_slots.prepare(
+                        attn_metadata_i.dquant_request_ids, attn_metadata_i.dquant_active_request_ids,
+                        attn_metadata_i.seq_lens_list, capturing=for_cudagraph_capture,
+                    )
+                    attn_metadata_i.dquant_batch_metadata = batch_metadata
+                    attn_metadata_i.dquant_pool_slots = slots
             for layer_name in attn_group.layer_names:
                 attn_metadata_dict[layer_name] = attn_metadata_i
 
@@ -5019,6 +5058,11 @@ class NPUModelRunner(GPUModelRunner):
             dict[str, tuple(torch.Tensor, torch.Tensor)] A map between layer names
             to their corresponding memory buffer for K cache and V cache.
         """
+        dense_reference = envs_ascend.VLLM_ASCEND_DQUANT_DENSE_REFERENCE
+        if (dquant_enabled(self.vllm_config) or dense_reference) and any(
+            hasattr(tensor, "layers") for tensor in kv_cache_config.kv_cache_tensors
+        ):
+            return self._allocate_dquant_layer_tensors(kv_cache_config)
         if self.ascend_config.kvpp_config.size > 1:
             self.hybrid_with_attn_and_mamba = False
             return allocate_kvpp_cache(self.vllm_config, kv_cache_config, self.device)
@@ -5679,6 +5723,35 @@ class NPUModelRunner(GPUModelRunner):
                         )
                         kv_caches[layer_name] = (indexer_k_cache, indexer_scale_cache)
                 elif isinstance(current_kv_cache_spec, AttentionSpec):
+                    if envs_ascend.VLLM_ASCEND_DQUANT_DENSE_REFERENCE:
+                        raw_key, raw_value = kv_cache_raw_tensors[layer_name]
+                        block_size = current_kv_cache_spec.block_size
+                        if self.use_hybrid_blocks:
+                            block_size = attn_backend.get_supported_kernel_block_sizes()[0]
+                        heads = current_kv_cache_spec.num_kv_heads
+                        key_size = current_kv_cache_spec.head_size
+                        value_size = current_kv_cache_spec.head_size_v or key_size
+                        dtype = current_kv_cache_spec.dtype
+                        kv_caches[layer_name] = (
+                            raw_key.view(dtype).view(-1, block_size, heads, key_size),
+                            raw_value.view(dtype).view(-1, block_size, heads, value_size),
+                        )
+                        continue
+                    if isinstance(current_kv_cache_spec, DQuantAttentionSpec):
+                        raw_key, raw_value = kv_cache_raw_tensors[layer_name]
+                        block_size = current_kv_cache_spec.block_size
+                        if self.use_hybrid_blocks:
+                            block_size = attn_backend.get_supported_kernel_block_sizes()[0]
+                        k_cache = raw_key.view(torch.uint8).view(
+                            -1, block_size, current_kv_cache_spec.key_record_bytes
+                        )
+                        v_cache = raw_value.view(torch.uint8).view(
+                            -1, block_size, current_kv_cache_spec.value_record_bytes
+                        )
+                        if k_cache.shape[0] != v_cache.shape[0] or k_cache.shape[0] < kv_cache_config.num_blocks:
+                            raise RuntimeError("D-Quant K/V record buffers do not cover the scheduler blocks.")
+                        kv_caches[layer_name] = (k_cache, v_cache)
+                        continue
                     # cache_only_layers (extract_hidden_states) are allocated
                     # as a single tensor by the branch at the top of
                     # _allocate_kv_cache_tensors; route them to the dedicated
@@ -6037,10 +6110,18 @@ class NPUModelRunner(GPUModelRunner):
                 elif isinstance(current_kv_cache_spec, MambaSpec):
                     raw_tensor = kv_cache_raw_tensors[layer_name]
                     assert raw_tensor is not None
-                    assert raw_tensor.numel() % current_kv_cache_spec.page_size_bytes == 0
-                    num_blocks = raw_tensor.numel() // current_kv_cache_spec.page_size_bytes
+                    private_dquant_layout = (
+                        dquant_enabled(self.vllm_config)
+                        or envs_ascend.VLLM_ASCEND_DQUANT_DENSE_REFERENCE
+                    ) and any(hasattr(tensor, "layers") for tensor in kv_cache_config.kv_cache_tensors)
+                    physical_page_bytes = (
+                        current_kv_cache_spec.real_page_size_bytes
+                        if private_dquant_layout else current_kv_cache_spec.page_size_bytes
+                    )
+                    assert raw_tensor.numel() % physical_page_bytes == 0
+                    num_blocks = raw_tensor.numel() // physical_page_bytes
                     assert num_blocks >= kv_cache_config.num_blocks
-                    if uses_padded_page_layout:
+                    if uses_padded_page_layout and not private_dquant_layout:
                         # Recurrent state shares its physical pages with the
                         # block-strided attention caches of the same pool. Both
                         # views must advance by the same padded page size so
@@ -6122,6 +6203,60 @@ class NPUModelRunner(GPUModelRunner):
                     raise ValueError("Unknown KV cache spec type.")
 
         return kv_caches
+
+    def _allocate_dquant_layer_tensors(self, kv_cache_config: KVCacheConfig):
+        """Translate standardized descriptors to private contiguous layer buffers.
+
+        The D-Quant eager bridge requires contiguous records. The worker scales
+        its advertised budget because upstream overlays scheduler groups while
+        this representation keeps their physical storage separate.
+        """
+        specs = self._get_layer_kv_cache_specs(kv_cache_config)
+        tensors = {}
+        self.hybrid_with_attn_and_mamba = False
+        alignment = 2 * 1024 * 1024
+        for descriptor in kv_cache_config.kv_cache_tensors:
+            if descriptor.host_resident:
+                raise NotImplementedError("D-Quant does not support host-resident KV pools")
+            for name in descriptor.layers:
+                if name in self.runner_only_attn_layers or name in tensors:
+                    continue
+                spec = specs[name]
+                blocks = kv_cache_config.num_blocks_of(descriptor)
+                if isinstance(spec, DQuantAttentionSpec):
+                    tensors[name] = (
+                        self._allocate_int8_cache_tensor(blocks * spec.key_page_size_bytes, alignment),
+                        self._allocate_int8_cache_tensor(blocks * spec.value_page_size_bytes, alignment),
+                    )
+                elif (
+                    isinstance(spec, FullAttentionSpec)
+                    and envs_ascend.VLLM_ASCEND_DQUANT_DENSE_REFERENCE
+                ):
+                    elements = blocks * spec.block_size * spec.num_kv_heads
+                    dtype_bytes = get_dtype_size(spec.dtype)
+                    tensors[name] = (
+                        self._allocate_int8_cache_tensor(
+                            elements * spec.head_size * dtype_bytes, alignment
+                        ),
+                        self._allocate_int8_cache_tensor(
+                            elements * (spec.head_size_v or spec.head_size) * dtype_bytes, alignment
+                        ),
+                    )
+                elif isinstance(spec, MambaSpec):
+                    # Private state buffers are contiguous and never share the
+                    # scheduler's padded attention/Mamba arena.
+                    tensors[name] = torch.zeros(
+                        blocks * spec.real_page_size_bytes, dtype=torch.int8, device=self.device
+                    )
+                else:
+                    raise NotImplementedError(
+                        f"D-Quant standardized allocation does not support {type(spec).__name__}"
+                    )
+        expected = set(specs) - set(self.runner_only_attn_layers)
+        if set(tensors) != expected:
+            raise RuntimeError("D-Quant descriptors do not cover all cache layers")
+        return tensors
+
 
     def may_reinitialize_input_batch(
         self,
@@ -6507,6 +6642,12 @@ class NPUModelRunner(GPUModelRunner):
                     attn_module, "align_kv_cache_with_mamba", True
                 ):
                     attn_layer_names.add(layer_name)
+
+        if dquant_enabled(self.vllm_config):
+            require_dquant_attention_backend(self.vllm_config)
+            for layer_name, spec in tuple(kv_cache_spec.items()):
+                if isinstance(spec, FullAttentionSpec) and not isinstance(spec, DQuantAttentionSpec):
+                    kv_cache_spec[layer_name] = DQuantAttentionSpec.from_spec(spec)
 
         if len(mamba_layers) > 0:
             mamba_page_size_padded = 0

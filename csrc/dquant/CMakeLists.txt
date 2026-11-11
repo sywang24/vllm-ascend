@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: Apache-2.0
+cmake_minimum_required(VERSION 3.16)
+project(dquant_native LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 17)
+set(SOC_VERSION Ascend910B3)
+set(RUN_MODE npu)
+set(ASCEND_CANN_PACKAGE_PATH "$ENV{ASCEND_HOME_PATH}" CACHE PATH "CANN toolkit root")
+if(NOT ASCEND_CANN_PACKAGE_PATH)
+    message(FATAL_ERROR "Source the CANN set_env.sh or set ASCEND_CANN_PACKAGE_PATH")
+endif()
+foreach(relative IN ITEMS
+        tools/tikcpp/ascendc_kernel_cmake
+        compiler/tikcpp/ascendc_kernel_cmake
+        ascendc_devkit/tikcpp/samples/cmake
+        aarch64-linux/tikcpp/ascendc_kernel_cmake)
+    if(EXISTS "${ASCEND_CANN_PACKAGE_PATH}/${relative}/ascendc.cmake")
+        set(ASCENDC_CMAKE_DIR "${ASCEND_CANN_PACKAGE_PATH}/${relative}")
+        break()
+    endif()
+endforeach()
+if(NOT ASCENDC_CMAKE_DIR)
+    message(FATAL_ERROR "Ascend C CMake integration not found in ${ASCEND_CANN_PACKAGE_PATH}")
+endif()
+include("${ASCENDC_CMAKE_DIR}/ascendc.cmake")
+ascendc_library(dquant_native SHARED native.cpp)
+install(TARGETS dquant_native LIBRARY DESTINATION vllm_ascend)
+option(DQUANT_BUILD_TEST_KERNELS "Build exact decoder-state test probe" OFF)
+if(DQUANT_BUILD_TEST_KERNELS)
+    ascendc_library(dquant_native_probe SHARED probe.cpp)
+endif()

@@ -16,9 +16,13 @@
 #
 """KV cache quantization methods for Ascend NPU."""
 
+from .dquant_codec import DQuantCodec, DQuantCodecConfig, DQuantPagedCache
 from .kv_c8 import AscendC8KVCacheAttentionMethod, AscendFAQuantAttentionMethod, AscendSFAQuantAttentionMethod
 
 __all__ = [
+    "DQuantCodec",
+    "DQuantCodecConfig",
+    "DQuantPagedCache",
     "AscendC8KVCacheAttentionMethod",
     "AscendFAQuantAttentionMethod",
     "AscendSFAQuantAttentionMethod",

@@ -15,7 +15,7 @@
 # This file is a part of the vllm-ascend project.
 #
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any
 
@@ -42,12 +42,14 @@ from vllm.v1.attention.ops.pcp import _gather_prefill_cache_inputs  # type: igno
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import AttentionSpec, CrossAttentionSpec
 
+from vllm_ascend import envs
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.context_parallel.common_cp import (
     get_pcp_num_replicated_tokens,
     is_pcp_decode_sharding_enabled,
 )
+from vllm_ascend.attention.dquant_attention import DQuantAttentionCache
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
     _select_seq_lens,
@@ -61,6 +63,7 @@ from vllm_ascend.compilation.updatable_graph import (
     get_capture_resource,
     register_task,
 )
+from vllm_ascend.core.kv_cache_interface import DQuantAttentionSpec, dquant_enabled, require_dquant_attention_backend
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import attention_transfer_window
@@ -170,6 +173,11 @@ class AscendMetadata:
 
     # **************************** Basic Properties ************************** #
     attn_mask: torch.Tensor | None = None
+    dquant_spec: DQuantAttentionSpec | None = None
+    dquant_request_ids: tuple[str, ...] = ()
+    dquant_active_request_ids: frozenset[str] = frozenset()
+    dquant_batch_metadata: torch.Tensor | None = None
+    dquant_pool_slots: tuple[int, ...] = ()
     # Current state of this attention run.
     attn_state: AscendAttentionState = AscendAttentionState.ChunkedPrefill
 
@@ -290,6 +298,11 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
     ) -> AttentionCGSupport:
         # Explicit override in case the underlying builder specialized this getter.
         # @override omitted only because of mypy limitation due to type variable.
+        if (
+            isinstance(kv_cache_spec, DQuantAttentionSpec)
+            and vllm_config.compilation_config.cudagraph_mode.name == "FULL_DECODE_ONLY"
+        ):
+            return AttentionCGSupport.UNIFORM_BATCH
         return AttentionCGSupport.ALWAYS
 
     def reorder_batch(self, input_batch, scheduler_output: "SchedulerOutput") -> bool:
@@ -562,6 +575,18 @@ class AscendAttentionBackendImpl(AttentionImpl):
 
         assert self.num_heads % self.num_kv_heads == 0
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
+        self._dquant_cache: DQuantAttentionCache | None = None
+        if dquant_enabled():
+            require_dquant_attention_backend(self.vllm_config)
+            if (
+                attn_type != AttentionType.DECODER
+                or sliding_window is not None
+                or alibi_slopes is not None
+                or logits_soft_cap is not None
+                or sinks is not None
+                or kv_sharing_target_layer_name is not None
+            ):
+                raise NotImplementedError("D-Quant supports causal full self-attention without KV sharing only.")
         self.key_cache = None
         self.value_cache = None
         self.is_kv_producer = (
@@ -609,7 +634,83 @@ class AscendAttentionBackendImpl(AttentionImpl):
         speculative_config=None,
         draft_attn_metadatas=None,
     ):
+        if dquant_enabled(vllm_config):
+            return
         raise NotImplementedError("FIA and PA should be use UpdatableGraph.")
+
+    def _forward_dquant(self, query, key, value, kv_cache, metadata, output):
+        graph_workspace = getattr(self, "_dquant_graph_workspace", None)
+        if not metadata.causal or (_EXTRA_CTX.capturing and graph_workspace is None):
+            raise NotImplementedError("D-Quant capture requires its full-decode runtime.")
+        if self._dquant_cache is None:
+            if kv_cache is None or len(kv_cache) != 2 or kv_cache[0].dtype != torch.uint8:
+                raise RuntimeError("D-Quant attention requires compact uint8 KV buffers.")
+            spec = getattr(metadata, "dquant_spec", None) or DQuantAttentionSpec(
+                block_size=kv_cache[0].shape[1],
+                num_kv_heads=self.num_kv_heads,
+                head_size=self.head_size,
+                dtype=query.dtype,
+            )
+            spec = replace(spec, block_size=kv_cache[0].shape[1], page_size_padded=None)
+            self._dquant_cache = DQuantAttentionCache(
+                kv_cache,
+                spec,
+                decode_chunk_size=envs.VLLM_ASCEND_DQUANT_DECODE_CHUNK_SIZE,
+                output_chunk=envs.VLLM_ASCEND_DQUANT_OUTPUT_CHUNK,
+                decode_workspace=getattr(self, "_dquant_decode_workspace", None),
+                max_num_seqs=(self.vllm_config.scheduler_config.max_num_seqs if hasattr(self, "vllm_config") else 32),
+            )
+        count = metadata.num_actual_tokens
+        if graph_workspace is not None and metadata.num_prefills == 0:
+            if metadata.dquant_batch_metadata is None or key is None or value is None:
+                raise ValueError("D-Quant decode graphs need persistent batch metadata and current KV")
+            return self._dquant_cache.graph_decode(
+                query,
+                metadata.block_tables,
+                metadata.dquant_batch_metadata,
+                self.scale,
+                output,
+                (metadata.slot_mapping, key, value),
+                graph_workspace,
+            )
+        if count == 0:
+            return output.zero_()
+        windowed = self._dquant_cache.spec.uses_window_state
+        request_ids = getattr(metadata, "dquant_request_ids", ())
+        if windowed:
+            active = metadata.dquant_active_request_ids
+            self._dquant_cache.release(set(self._dquant_cache.recent) - active)
+            if not request_ids or key is None or value is None:
+                raise ValueError("D-Quant windows require request IDs and current K/V")
+            if graph_workspace is not None:
+                starts = [0] + metadata.actual_seq_lengths_q[:-1]
+                prefixes = [
+                    length - (end - start)
+                    for start, end, length in zip(starts, metadata.actual_seq_lengths_q, metadata.seq_lens_list)
+                ]
+                self._dquant_cache.bind_recent_slots(request_ids, metadata.dquant_pool_slots, prefixes)
+        elif key is not None and value is not None:
+            self._dquant_cache.write(metadata.slot_mapping[:count], key[:count], value[:count])
+            notify_kv_cache_written()
+        # A runner may append a dummy request for padded model tokens. Only
+        # real query ranges are allowed to read the physical block table.
+        query_ends = [end for end in metadata.actual_seq_lengths_q if end <= count]
+        if not query_ends or query_ends[-1] != count:
+            raise ValueError("D-Quant metadata does not cover all actual query tokens")
+        result = self._dquant_cache.attention(
+            query,
+            metadata.block_tables,
+            query_ends,
+            metadata.seq_lens_list[: len(query_ends)],
+            self.scale,
+            output,
+            metadata.attn_mask,
+            request_ids=request_ids if windowed else None,
+            updates=(metadata.slot_mapping[:count], key[:count], value[:count]) if windowed else None,
+        )
+        if windowed:
+            notify_kv_cache_written()
+        return result
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
         super().process_weights_after_loading(act_dtype)
@@ -1291,6 +1392,9 @@ class AscendAttentionBackendImpl(AttentionImpl):
         Returns:
             shape = [num_tokens, num_heads * head_size]
         """
+        if dquant_enabled() and attn_metadata is not None:
+            assert output is not None
+            return self._forward_dquant(query, key, value, kv_cache, attn_metadata, output)
         assert output is not None, "Output tensor must be provided."
         self._layer_name = layer.layer_name
 
