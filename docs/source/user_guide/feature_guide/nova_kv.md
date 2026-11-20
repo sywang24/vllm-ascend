@@ -1,5 +1,7 @@
 # NOVA-KV (Experimental)
 
+The A5 prototype is described in [NOVA Cube attention](nova_kv_cube.md).
+
 NOVA-KV stores Qwen3.5 dense-text full-attention history using group-VQ keys
 and packed INT2 values. At head dimension 256, each KV head occupies 134 bytes
 per token: 64 key-code bytes, 64 value-code bytes and three BF16 parameters.

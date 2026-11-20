@@ -36,6 +36,18 @@ def test_disabled_constructor_keeps_original_arguments(monkeypatch):
     assert calls == [((layer, 4, 256, 0.0625), {"prefix": "model.layers.0.self_attn.attn"})]
 
 
+@pytest.mark.parametrize("v2,batch,length", [(False, 4, 91024), (True, 5, 91024), (True, 4, 100000)])
+def test_cube_rejects_unsupported_runner_or_capacity(monkeypatch, v2, batch, length):
+    config = make_config({"artifact_path": "/artifacts", "backend": "cube"})
+    config.use_v2_model_runner = v2
+    config.scheduler_config.max_num_seqs = batch
+    config.model_config.max_model_len = length
+    monkeypatch.setattr(patch, "get_current_vllm_config", lambda: config)
+    monkeypatch.setattr(patch, "enable_sp", lambda config: False)
+    with pytest.raises(ValueError, match="NOVA Cube"):
+        patch.nova_init(SimpleNamespace(), 4, 256, 0.0625)
+
+
 @pytest.mark.parametrize("use_v2", [False, True])
 def test_backend_selected_before_original_initialization(monkeypatch, use_v2):
     config = make_config({"artifact_path": "/artifacts", "direct_library_root": "/kernel"})

@@ -42,6 +42,11 @@ def nova_init(self, *args, **kwargs):
         return _ORIGINAL_INIT(self, *args, **kwargs)
     options = NovaKVConfig(**raw_options)
     _validate(config)
+    if options.backend == "cube":
+        if not config.use_v2_model_runner or config.scheduler_config.max_num_seqs > 4:
+            raise ValueError("NOVA Cube requires Model Runner V2 and max_num_seqs <= 4")
+        if config.model_config.max_model_len > 96 * 1024:
+            raise ValueError("NOVA Cube currently supports at most 96K context")
     if options.capture_path and config.compilation_config.cudagraph_mode.name != "NONE":
         raise ValueError("NOVA-KV calibration capture requires --enforce-eager")
     if options.artifact_path and config.compilation_config.cudagraph_mode.name not in ("NONE", "FULL_DECODE_ONLY"):
@@ -77,6 +82,10 @@ def nova_init(self, *args, **kwargs):
         from vllm_ascend.attention.nova_kv_v2 import NovaV2AttentionBackend
 
         backend = NovaV2AttentionBackend
+        if options.backend == "cube":
+            from vllm_ascend.attention.nova_kv_cube import NovaCubeAttentionBackend
+
+            backend = NovaCubeAttentionBackend
     if arguments.arguments.get("attn_backend") not in (None, backend):
         raise ValueError("NOVA-KV conflicts with an explicitly selected attention backend")
     arguments.arguments["attn_backend"] = backend

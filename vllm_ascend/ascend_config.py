@@ -75,18 +75,23 @@ class NovaKVConfig:
     direct_split_tokens: int = 1024
     prefill_query_tile: int = 2048
     prefill_kv_tile: int = 2048
+    backend: str = "direct"
 
     def __post_init__(self):
         if bool(self.artifact_path) == bool(self.capture_path):
             raise ValueError("nova_kv requires exactly one of artifact_path and capture_path")
-        if self.artifact_path and not self.direct_library_root:
+        if self.backend not in ("direct", "cube"):
+            raise ValueError("nova_kv backend must be direct or cube")
+        if self.backend == "cube" and (not self.artifact_path or self.direct_split_tokens != 1024):
+            raise ValueError("NOVA Cube requires calibration artifacts and split size 1024")
+        if self.artifact_path and self.backend == "direct" and not self.direct_library_root:
             raise ValueError("nova_kv requires direct_library_root for compressed attention")
         if self.sink_tokens < 0 or self.recent_tokens < 1:
             raise ValueError("nova_kv requires sink_tokens >= 0 and recent_tokens >= 1")
         if min(self.codec_batch_size, self.sample_tokens, self.prefill_kv_tile) < 1:
             raise ValueError("nova_kv batch, sample and KV tile sizes must be positive")
-        if not 1 <= self.prefill_query_tile <= 2048:
-            raise ValueError("nova_kv prefill_query_tile must be between 1 and 2048")
+        if not 1 <= self.prefill_query_tile <= (8192 if self.backend == "cube" else 2048):
+            raise ValueError("nova_kv prefill_query_tile exceeds the selected backend limit")
         if self.direct_split_tokens not in (128, 256, 512, 1024):
             raise ValueError("nova_kv direct_split_tokens must be 128, 256, 512 or 1024")
 

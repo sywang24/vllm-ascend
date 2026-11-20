@@ -75,6 +75,7 @@ def nova_quant_flash_attention(
     causal_mask=None,
     query_tile=None,
     kv_tile=None,
+    prefill_impl=None,
 ):
     """Attend to compressed history and exact tokens without a full KV mirror.
 
@@ -106,7 +107,7 @@ def nova_quant_flash_attention(
             return result.reshape(heads, groups, count, dim).permute(2, 0, 1, 3), None
         cold = planar_cold_reader(*views, block_table, codec)
         exact = exact_window_reader(window.key, window.value, request_slot, window.sink, window.ring, old_length)
-        return bounded_fia_prefill(
+        return (prefill_impl or bounded_fia_prefill)(
             query,
             key,
             value,

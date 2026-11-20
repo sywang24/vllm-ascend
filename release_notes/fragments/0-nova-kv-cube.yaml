@@ -1,0 +1,9 @@
+pr: 0
+entries:
+  - category: feature
+    text: >-
+      Added an experimental NOVA Cube compressed KV attention backend for
+      calibrated dense Qwen models on Ascend A5 with Model Runner V2, selected
+      with nova_kv.backend="cube" in additional config. The prototype supports
+      up to four active requests; full task accuracy and broader device coverage
+      remain pending.

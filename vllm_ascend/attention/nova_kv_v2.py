@@ -117,6 +117,7 @@ class NovaV2AttentionImpl(NovaAttentionImpl):
                 causal_mask=self._causal_mask,
                 query_tile=self._prefill_query_tile,
                 kv_tile=self._prefill_kv_tile,
+                prefill_impl=getattr(self, "_prefill_impl", None),
             )
             output[start:end].copy_(result.reshape_as(output[start:end]).to(output.dtype))
             nova_exact_window_update(
