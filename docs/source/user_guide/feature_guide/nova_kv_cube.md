@@ -16,7 +16,7 @@ artifacts are still required; see [NOVA-KV](nova_kv.md).
 Compressed allocator pages persist across steps. Prefill temporarily reconstructs
 one request's current layer K/V for FIA. Decode uses lookup QK and on-chip INT2
 V unpacking for Cube PV, with a separate exact window and FP32 LSE reduction.
-There is no persistent full-history BF16 mirror. The measured batch-4 tuning is
+There is no persistent full-history BF16 mirror. The measured batch-1/4 tuning is
 fixed in this prototype, without the benchmark-only environment overrides.
 
 ```bash
@@ -56,29 +56,37 @@ or sampled competing process; each request generates 1,024 tokens:
 
 | TP2 workload | BF16 Decode tok/s | Cube Decode tok/s | BF16 TPOT ms | Cube TPOT ms |
 | --- | ---: | ---: | ---: | ---: |
-| 90K input / batch 4 | 125.40 | 112.34 | 48.77 | 54.11 |
-| 30K input / batch 1 | 50.89 | 45.59 | 19.63 | 21.91 |
+| 90K input / batch 4 | 125.67 | 115.05 | 48.69 | 53.51 |
+| 30K input / batch 1 | 51.10 | 53.61 | 19.55 | 18.63 |
 
-The 10% maximum degradation target is not achieved. Pure B4 step time is
-35.61 ms versus BF16 31.90 ms. B4 TPOT also includes requests decoding
-alongside other requests' prefill. These results are from the measured source
-snapshot, not a claim of compatibility with current upstream main.
+These post-optimization measurements meet the 10% Decode degradation target
+in both workloads. At 90K/B4, throughput is 8.45% lower, pure step time is
+34.77 ms versus BF16 31.83 ms (+9.23%), and TPOT is 9.90% higher. At 30K/B1,
+throughput is 4.90% higher and TPOT is 4.71% lower. B4 TPOT includes requests
+decoding alongside other requests' prefill. B4 TTFT remains 10.52% higher
+(32.96 s versus 29.82 s), outside a 10% TTFT target. Each result is one warmed
+wave, not a statistical guarantee across runs. Results use the isolated
+packaged source, not current upstream main.
 
 Separate 30K/B1 Decode profiling, 12 steps, rank 0, totals across 16 layers:
 
 | Kernel | BF16 ms/step | Cube ms/step |
 | --- | ---: | ---: |
-| `FusedInferAttentionScore` | 3.5557 | - |
-| `_score_persistent` | - | 0.9234 |
-| `_split_weights` | - | 0.1578 |
-| `_pv_prepared` | - | 0.5576 |
-| `_merge_compressed` | - | 0.3806 |
-| `_exact_and_cold` | - | 1.9826 |
+| `FusedInferAttentionScore` | 3.5576 | - |
+| `_score_persistent` | - | 1.0367 |
+| `_split_weights` | - | 0.1822 |
+| `_pv_prepared` | - | 0.5585 |
+| `merge_one_pass` | - | 0.3825 |
+| `_exact_tiles` | - | 0.4465 |
+| `_merge_exact_tiles` | - | 0.0579 |
 
 Kernel totals are not end-to-end critical-path measurements. Encoding and
-Query/LUT preparation are additional. Batch 1 still uses the older exact-window
-merge; batch 4 has fused encoding/projection, one-pass reduction and ordered
-side-stream execution. Full task accuracy for this combination has not been
+Query/LUT preparation are additional. The former 30K/B1 `_exact_and_cold`
+cost 1.9826 ms/step; tiled exact attention plus merging now total 0.5044 ms
+(-74.56%). Both batches use fused encoding/projection, one-pass cold reduction,
+and exact tiles on the side stream. Batch 4 schedules exact tiles before
+encoding; long-context B4 uses 4,096-token PV splits instead of 1,024 tokens.
+Full task accuracy for this combination has not been
 evaluated; texts are not uniformly identical across runs. This branch remains
 experimental pending API review, quality, device and upstream coverage.
 
@@ -97,6 +105,14 @@ An A5 TP2 smoke run also completed 30K/B1 and 90K/B4 chunked prefill,
 graph capture and 16 generated tokens per request through the packaged backend.
 These checks do not replace a model/task accuracy evaluation or repeat of the
 full performance benchmark after porting.
+
+The subsequent Decode optimization passed 64 numerical cases covering both
+batches, both ranks and all 16 full-attention layers, including 64 dynamic
+captured graph replays and invalid slots. Compressed packets matched exactly;
+maximum absolute attention-output error against the serial reference was
+6.8e-6. Empty and partially filled exact windows were checked separately.
+The final HTTP and profiling workloads were rerun after these changes;
+raw evidence remains under `/home/w00807672/nova-kv-cube-rfc-20261120` on A5.
 
 Ruff, codespell, typos, Markdown lint, import/package checks, logger checks,
 long-function documentation and symbolic-meta checks passed. The complete

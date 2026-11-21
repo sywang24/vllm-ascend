@@ -231,7 +231,7 @@ class ExactWindowPool:
             self.capacity,
             self.limit,
             scale,
-            32,
+            64,
         )
         return output, lse, buffers
 
@@ -268,12 +268,21 @@ def _exact_and_cold(
     maximum = tl.load(COLD_LSE + bh * G + group)
     denominator = tl.where(maximum > -float("inf"), 1.0, 0.0)
     accum = tl.load(COLD + (bh * G + group) * D + dims).to(tl.float32) * denominator
-    recent_start = tl.maximum(SINK, length - RING)
+    # Once the exact window is full, the sink plus ring is a permutation of
+    # the complete retained set. Reading physical rows directly avoids the
+    # per-lane logical-position arithmetic in the hot path. Short requests
+    # still need the mapping to exclude stale ring rows.
+    full_window = length >= CAPACITY
     for begin in range(0, CAPACITY, TILE):
         offsets = begin + tl.arange(0, TILE)
-        position = tl.where(offsets < SINK, offsets, recent_start + offsets - SINK)
-        valid = valid_request & (offsets < CAPACITY) & (position < length)
-        index = tl.where(offsets < SINK, offsets, SINK + position % RING)
+        if full_window:
+            valid = valid_request & (offsets < CAPACITY)
+            index = offsets
+        else:
+            recent_start = tl.maximum(SINK, length - RING)
+            position = tl.where(offsets < SINK, offsets, recent_start + offsets - SINK)
+            valid = valid_request & (offsets < CAPACITY) & (position < length)
+            index = tl.where(offsets < SINK, offsets, SINK + position % RING)
         addresses = ((slot * CAPACITY + index) * H + head) * D
         key = tl.load(KEY + addresses[:, None] + dims[None, :], valid[:, None], 0).to(tl.float32)
         scores = tl.sum(key * q[None, :], 1) * SCALE

@@ -13,7 +13,7 @@ from vllm_ascend.ops.nova_kv import nova_exact_window_update
 from vllm_ascend.ops.triton.nova_compressed_state import ExactWindowPool, planar_cache_views
 from vllm_ascend.ops.triton.nova_cube.nova_decode_encode_a5 import encode_decode_cache, prepare_encoder
 from vllm_ascend.ops.triton.nova_cube.nova_decode_query_a5 import prepare_query_projection, project_query
-from vllm_ascend.ops.triton.nova_cube.nova_exact_a5 import exact_only, exact_physical, merge_into
+from vllm_ascend.ops.triton.nova_cube.nova_exact_a5 import exact_partial, exact_physical, merge_partial_into
 from vllm_ascend.ops.triton.nova_cube.nova_prefill_a5 import bounded_fia_prefill
 from vllm_ascend.ops.triton.nova_cube.nova_query_lut import TritonQueryLut
 from vllm_ascend.ops.triton.nova_cube.nova_triton_fixed_split import TritonFixedSplitDecode
@@ -33,6 +33,8 @@ _ENCODE_OVERLAP = True
 _EXACT_OVERLAP = True
 _MERGE_DIMS = 64
 _QUERY_PROJECT = 2
+_LONG_CONTEXT_SPLIT_TOKENS = 4096
+_LONG_CONTEXT_MIN_TOKENS = 65536
 
 
 @lru_cache(maxsize=8)
@@ -102,7 +104,7 @@ class NovaCubeAttentionImpl(NovaV2AttentionImpl):
             if (
                 _ENCODE_GROUP
                 and attn_metadata.attn_state == AscendAttentionState.DecodeOnly
-                and len(attn_metadata.seq_lens_list) == 4
+                and len(attn_metadata.seq_lens_list) in (1, 4)
                 and output is not None
                 and output_scale is None
                 and output_block_scale is None
@@ -113,22 +115,36 @@ class NovaCubeAttentionImpl(NovaV2AttentionImpl):
                 codec = self._codec(layer, query.device)
                 self._ensure_runtime(query.device, query.dtype)
                 views = planar_cache_views(kv_cache)
-                requests = attn_metadata.nova_request_slots[:4].contiguous()
-                if output.shape[0] != 4:
+                batch = len(attn_metadata.seq_lens_list)
+                requests = attn_metadata.nova_request_slots[:batch].contiguous()
+                if output.shape[0] != batch:
                     output.zero_()
                 if _ENCODE_OVERLAP and self._window.ring >= 256:
                     stream = _encode_stream(query.device)
+                    if batch == 4:
+                        return self._decode(
+                            query,
+                            key,
+                            value,
+                            views,
+                            attn_metadata,
+                            output,
+                            codec,
+                            requests,
+                            pending_encoder=stream,
+                            encode_after_exact=True,
+                        )
                     current = torch.npu.current_stream(query.device)
                     # The current token lies beyond even the final padded cold tile.
                     # Finish the writer before returning so allocator reuse is ordered.
                     stream.wait_stream(current)
                     with torch.npu.stream(stream):
                         encode_decode_cache(
-                            key[:4],
-                            value[:4],
+                            key[:batch],
+                            value[:batch],
                             codec,
                             views,
-                            attn_metadata.slot_mapping[:4],
+                            attn_metadata.slot_mapping[:batch],
                             requests,
                             self._limit,
                             _ENCODE_GROUP,
@@ -137,11 +153,11 @@ class NovaCubeAttentionImpl(NovaV2AttentionImpl):
                         query, key, value, views, attn_metadata, output, codec, requests, pending_encoder=stream
                     )
                 encode_decode_cache(
-                    key[:4],
-                    value[:4],
+                    key[:batch],
+                    value[:batch],
                     codec,
                     views,
-                    attn_metadata.slot_mapping[:4],
+                    attn_metadata.slot_mapping[:batch],
                     requests,
                     self._limit,
                     _ENCODE_GROUP,
@@ -158,7 +174,19 @@ class NovaCubeAttentionImpl(NovaV2AttentionImpl):
             codec.encode(key, value, chunk_size=self._options.codec_batch_size)
         return output.zero_()
 
-    def _decode(self, query, key, value, views, metadata, output, codec, request_slots=None, pending_encoder=None):
+    def _decode(
+        self,
+        query,
+        key,
+        value,
+        views,
+        metadata,
+        output,
+        codec,
+        request_slots=None,
+        pending_encoder=None,
+        encode_after_exact=False,
+    ):
         batch = len(metadata.seq_lens_list)
         if not 1 <= batch <= 4:
             raise ValueError("fixed-split Cube requires 1..4 decode requests")
@@ -198,21 +226,37 @@ class NovaCubeAttentionImpl(NovaV2AttentionImpl):
         grouped = query[:batch].reshape(batch, self.num_kv_heads, -1, self.head_size).float().contiguous()
         side = None
         # Exact attention shares the encoder stream; cold PV only reads older KV.
-        if _EXACT_OVERLAP and batch == 4 and _EXACT_TILE and output.is_contiguous():
+        if _EXACT_OVERLAP and batch in (1, 4) and _EXACT_TILE and output.is_contiguous():
             grouped = grouped.contiguous()
             side = _encode_stream(query.device)
             current = torch.npu.current_stream(query.device)
-            exact, exact_lse = get_capture_resource(
+            parts = triton.cdiv(self._window.capacity, _EXACT_TILE)
+            exact = get_capture_resource(
                 ("nova_parallel_exact", batch, self.num_kv_heads, self.num_heads, query.device),
                 lambda: (
-                    torch.empty_like(grouped),
-                    torch.empty(grouped.shape[:-1], device=query.device, dtype=torch.float32),
+                    torch.empty((*grouped.shape[:-1], parts, self.head_size), device=query.device, dtype=torch.float32),
+                    torch.empty((*grouped.shape[:-1], parts), device=query.device, dtype=torch.float32),
                 ),
             )
             side.wait_stream(current)
             with torch.npu.stream(side):
-                exact_only(self._window, grouped, request_slots, lengths, self.scale, exact, exact_lse, _EXACT_TILE)
-        if _QUERY_PROJECT and batch == 4:
+                exact_partial(self._window, grouped, request_slots, lengths, self.scale, _EXACT_TILE, exact)
+        if encode_after_exact:
+            # Launch the short exact reduction before encoding occupies the AIVs.
+            # Current-token compressed KV is outside the padded cold read range.
+            pending_encoder.wait_stream(torch.npu.current_stream(query.device))
+            with torch.npu.stream(pending_encoder):
+                encode_decode_cache(
+                    key[:batch],
+                    value[:batch],
+                    codec,
+                    views,
+                    metadata.slot_mapping[:batch],
+                    request_slots,
+                    self._limit,
+                    _ENCODE_GROUP,
+                )
+        if _QUERY_PROJECT and batch in (1, 4):
             transformed, mean = project_query(grouped, codec, fuse_outputs=_QUERY_PROJECT >= 2)
         else:
             transformed = torch.einsum("bhgd,hde->bhge", grouped, codec.key_inverse.transpose(-1, -2)).contiguous()
@@ -224,7 +268,9 @@ class NovaCubeAttentionImpl(NovaV2AttentionImpl):
                 self.num_kv_heads,
                 self.num_heads // self.num_kv_heads,
                 query.device,
-                split_tokens=1024,
+                split_tokens=_LONG_CONTEXT_SPLIT_TOKENS
+                if batch == 4 and max_tokens >= _LONG_CONTEXT_MIN_TOKENS
+                else 1024,
                 tile_tokens=_PV_TILE,
                 value_dims=_VALUE_DIMS,
                 feed_tokens=_PV_FEED,
@@ -235,7 +281,7 @@ class NovaCubeAttentionImpl(NovaV2AttentionImpl):
                 score_tile=_SCORE_TILE,
                 fuse_score_weights=_FUSE_SCORE_WEIGHTS and batch == 4,
                 launch_options={"num_stages": _PV_STAGES if batch == 4 else 1},
-                merge_dims=_MERGE_DIMS if batch == 4 else 0,
+                merge_dims=_MERGE_DIMS if batch in (1, 4) else 0,
                 score_stages=_SCORE_STAGES if batch == 4 else 1,
             ),
         )
@@ -254,7 +300,7 @@ class NovaCubeAttentionImpl(NovaV2AttentionImpl):
         cold = torch.einsum("bhgd,hde->bhge", cold, codec.value_transform.transpose(-1, -2))
         if side is not None:
             current.wait_stream(side)
-            merge_into(cold, cold_lse, exact, exact_lse, output[:batch])
+            merge_partial_into(cold, cold_lse, exact, output[:batch])
             return output
         if _EXACT_TILE and batch == 4:
             result, _, _ = exact_physical(

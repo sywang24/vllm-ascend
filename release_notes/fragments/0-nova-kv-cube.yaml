@@ -7,3 +7,9 @@ entries:
       with nova_kv.backend="cube" in additional config. The prototype supports
       up to four active requests; full task accuracy and broader device coverage
       remain pending.
+  - category: performance
+    text: >-
+      Parallelized exact-window Decode attention and optimized batch-1 encoding
+      and projection. Matched A5 TP2 measurements show 8.45% lower Decode
+      throughput than BF16 at 90K/batch 4 and 4.90% higher throughput at
+      30K/batch 1; batch-4 TPOT is 9.90% higher.

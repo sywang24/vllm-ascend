@@ -30,7 +30,7 @@ class TritonFixedSplitDecode(TritonPipelineDecode):
             or fuse_score_weights
             or score_stages != 1
             or merge_dims not in (0, 64)
-            or self.split_tokens != 1024
+            or self.split_tokens not in (1024, 2048, 4096)
         ):
             raise ValueError("unsupported experimental Cube configuration")
         self.feed_tokens = feed_tokens
