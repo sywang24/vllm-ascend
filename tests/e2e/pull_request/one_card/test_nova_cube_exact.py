@@ -6,14 +6,20 @@ import torch
 import torch_npu  # noqa: F401
 
 from vllm_ascend.ops.triton.nova_compressed_state import ExactWindowPool, merge_attention_segments
-from vllm_ascend.ops.triton.nova_cube.nova_exact_a5 import exact_partial, exact_physical, merge_partial_into
+from vllm_ascend.ops.triton.nova_cube.nova_exact_a5 import (
+    exact_partial,
+    exact_partial_grouped,
+    exact_physical,
+    merge_partial_into,
+)
 
 pytestmark = pytest.mark.skipif(not torch.npu.is_available(), reason="NPU required")
 
 
 @pytest.mark.parametrize("batch", [1, 4])
 @pytest.mark.parametrize("sink,recent", [(0, 31), (7, 64), (64, 256)])
-def test_exact_tiles_replay_masks_partial_rings_and_invalid_slots(batch, sink, recent):
+@pytest.mark.parametrize("exact_kernel", [exact_partial, exact_partial_grouped], ids=["per_group", "grouped"])
+def test_exact_tiles_replay_masks_partial_rings_and_invalid_slots(batch, sink, recent, exact_kernel):
     torch.manual_seed(8347)
     device = torch.device("npu:0")
     torch.npu.set_device(device)
@@ -26,11 +32,11 @@ def test_exact_tiles_replay_masks_partial_rings_and_invalid_slots(batch, sink, r
     cold_lse = torch.empty(query.shape[:-1], device=device)
     lengths = torch.ones(batch, dtype=torch.int32, device=device)
     slots = torch.full((batch,), -1, dtype=torch.int32, device=device)
-    partial = exact_partial(window, query, slots, lengths, 1 / 16, 64)
+    partial = exact_kernel(window, query, slots, lengths, 1 / 16, 64)
     out = torch.empty_like(query)
 
     def run():
-        exact_partial(window, query, slots, lengths, 1 / 16, 64, partial)
+        exact_kernel(window, query, slots, lengths, 1 / 16, 64, partial)
         merge_partial_into(cold, cold_lse, partial, out)
 
     cold_lse.fill_(-float("inf"))

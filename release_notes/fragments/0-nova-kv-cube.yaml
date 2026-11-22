@@ -9,7 +9,8 @@ entries:
       remain pending.
   - category: performance
     text: >-
-      Parallelized exact-window Decode attention and optimized batch-1 encoding
-      and projection. Matched A5 TP2 measurements show 8.45% lower Decode
-      throughput than BF16 at 90K/batch 4 and 4.90% higher throughput at
-      30K/batch 1; batch-4 TPOT is 9.90% higher.
+      Parallelized exact-window Decode attention, reused K/V tiles across
+      query groups at batch 4, and optimized batch-1 encoding and projection.
+      Matched A5 TP2 measurements show 8.45% lower Decode throughput than BF16
+      at 90K/batch 4 and 5.99% higher throughput at 30K/batch 1; batch-4 TPOT
+      is 9.88% higher.

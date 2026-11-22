@@ -210,6 +210,93 @@ def exact_partial(window, query, slots, lengths, scale, tile=64, buffers=None):
 
 
 @triton.jit
+def _exact_tiles_grouped(
+    Q,
+    SLOTS,
+    LENGTHS,
+    KEY,
+    VALUE,
+    PARTIAL,
+    LSE,
+    H: tl.constexpr,
+    G: tl.constexpr,
+    D: tl.constexpr,
+    SINK: tl.constexpr,
+    RING: tl.constexpr,
+    LIMIT: tl.constexpr,
+    SCALE: tl.constexpr,
+    T: tl.constexpr,
+    PARTS: tl.constexpr,
+):
+    """Reuse one K/V tile across the query groups sharing a KV head."""
+    bh, part = tl.program_id(0), tl.program_id(1)
+    slot, length = tl.load(SLOTS + bh // H), tl.load(LENGTHS + bh // H)
+    active = (slot >= 0) & (slot < LIMIT) & (length > 0)
+    safe_slot = tl.where(active, slot, LIMIT)
+    row = part * T + tl.arange(0, T)
+    valid = active & (row < SINK + RING)
+    if length < SINK + RING:
+        tail = (length - 1) % RING
+        back = (tail - (row - SINK) + RING) % RING
+        valid &= tl.where(row < SINK, row < length, length - 1 - back >= SINK)
+        index = tl.where(row < SINK, row, SINK + (length - 1 - back) % RING)
+    else:
+        index = row
+    dim = tl.arange(0, D)
+    address = ((safe_slot * (SINK + RING) + index) * H + bh % H) * D
+    keys = tl.load(KEY + address[:, None] + dim[None, :], valid[:, None], 0).to(tl.float32)
+    values = tl.load(VALUE + address[:, None] + dim[None, :], valid[:, None], 0).to(tl.float32)
+    for group in range(G):
+        head = bh * G + group
+        query = tl.load(Q + head * D + dim).to(tl.float32)
+        logits = tl.where(valid, tl.sum(keys * query[None, :], 1) * SCALE, -float("inf"))
+        peak = tl.max(logits, 0)
+        safe_peak = tl.where(peak > -float("inf"), peak, 0.0)
+        weights = tl.exp(logits - safe_peak)
+        denom = tl.sum(weights, 0)
+        output = tl.sum(values * weights[:, None], 0) / tl.maximum(denom, 1.0e-30)
+        state = head * PARTS + part
+        tl.store(PARTIAL + state * D + dim, output)
+        tl.store(LSE + state, tl.where(denom > 0, safe_peak + tl.log(denom), -float("inf")))
+
+
+def exact_partial_grouped(window, query, slots, lengths, scale, tile=64, buffers=None):
+    """Launch the grouped exact kernel when several Q groups share a KV head."""
+    batch, heads, groups, dim = query.shape
+    if groups < 2 or dim != 256 or tile not in (32, 64, 128):
+        return exact_partial(window, query, slots, lengths, scale, tile, buffers)
+    parts = triton.cdiv(window.capacity, tile)
+    if buffers is None:
+        buffers = (
+            torch.empty((*query.shape[:-1], parts, dim), device=query.device, dtype=torch.float32),
+            torch.empty((*query.shape[:-1], parts), device=query.device, dtype=torch.float32),
+        )
+    partial, lse = buffers
+    _exact_tiles_grouped[(batch * heads, parts)](
+        query,
+        slots,
+        lengths,
+        window.key,
+        window.value,
+        partial,
+        lse,
+        heads,
+        groups,
+        dim,
+        window.sink,
+        window.ring,
+        window.limit,
+        scale,
+        tile,
+        parts,
+        compile_mode="simd",
+        num_stages=1,
+        enable_auto_bind_sub_block=False,
+    )
+    return partial, lse
+
+
+@triton.jit
 def _merge_exact_tiles(
     COLD,
     CLSE,

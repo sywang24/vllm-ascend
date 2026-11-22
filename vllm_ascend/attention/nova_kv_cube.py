@@ -13,7 +13,12 @@ from vllm_ascend.ops.nova_kv import nova_exact_window_update
 from vllm_ascend.ops.triton.nova_compressed_state import ExactWindowPool, planar_cache_views
 from vllm_ascend.ops.triton.nova_cube.nova_decode_encode_a5 import encode_decode_cache, prepare_encoder
 from vllm_ascend.ops.triton.nova_cube.nova_decode_query_a5 import prepare_query_projection, project_query
-from vllm_ascend.ops.triton.nova_cube.nova_exact_a5 import exact_partial, exact_physical, merge_partial_into
+from vllm_ascend.ops.triton.nova_cube.nova_exact_a5 import (
+    exact_partial,
+    exact_partial_grouped,
+    exact_physical,
+    merge_partial_into,
+)
 from vllm_ascend.ops.triton.nova_cube.nova_prefill_a5 import bounded_fia_prefill
 from vllm_ascend.ops.triton.nova_cube.nova_query_lut import TritonQueryLut
 from vllm_ascend.ops.triton.nova_cube.nova_triton_fixed_split import TritonFixedSplitDecode
@@ -240,7 +245,9 @@ class NovaCubeAttentionImpl(NovaV2AttentionImpl):
             )
             side.wait_stream(current)
             with torch.npu.stream(side):
-                exact_partial(self._window, grouped, request_slots, lengths, self.scale, _EXACT_TILE, exact)
+                # Grouped tiles help B4; B1 needs the larger per-group grid.
+                exact_kernel = exact_partial_grouped if batch == 4 else exact_partial
+                exact_kernel(self._window, grouped, request_slots, lengths, self.scale, _EXACT_TILE, exact)
         if encode_after_exact:
             # Launch the short exact reduction before encoding occupies the AIVs.
             # Current-token compressed KV is outside the padded cold read range.
